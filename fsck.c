@@ -381,7 +381,7 @@ static int fsck_walk_tree(struct tree *tree, void *data, struct fsck_options *op
 						     name, entry.path);
 			result = options->walk(obj, OBJ_TREE, data, options);
 		}
-		else if (S_ISREG(entry.mode) || S_ISLNK(entry.mode)) {
+		else if (S_ISREG(entry.mode) || S_ISLNK(entry.mode) || S_ISMANIFEST(entry.mode)) {
 			/* Regular files can be blobs or manifests depending on mode */
 			if (object_type(entry.mode) == OBJ_MANIFEST) {
 				obj = (struct object *)lookup_manifest(the_repository, &entry.oid);
@@ -507,6 +507,8 @@ int fsck_walk(struct object *obj, void *data, struct fsck_options *options)
 		return fsck_walk_commit((struct commit *)obj, data, options);
 	case OBJ_TAG:
 		return fsck_walk_tag((struct tag *)obj, data, options);
+	case OBJ_MANIFEST:
+		return 0;
 	default:
 		error("Unknown object type for %s",
 		      fsck_describe_object(options, &obj->oid));
@@ -739,6 +741,8 @@ static int fsck_tree(const struct object_id *tree_oid,
 		case S_IFLNK:
 		case S_IFDIR:
 		case S_IFGITLINK:
+		case S_IFMANIFEST | 0755:
+		case S_IFMANIFEST | 0644:
 			break;
 		/*
 		 * This is nonstandard, but we had a few of these
