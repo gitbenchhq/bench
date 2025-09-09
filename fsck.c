@@ -20,6 +20,7 @@
 #include "utf8.h"
 #include "manifest.h"
 #include "oidset.h"
+#include "oid-array.h"
 #include "packfile.h"
 #include "submodule-config.h"
 #include "config.h"
@@ -1231,15 +1232,86 @@ int fsck_object(struct object *obj, void *data, unsigned long size,
 static int fsck_manifest(const struct object_id *oid, const char *buf,
 			 unsigned long size, struct fsck_options *options)
 {
-	/*
-	 * For v1 manifests, we just need to verify basic structure.
-	 * In the future, we'll validate chunk OID references.
-	 */
+	struct manifest_header header;
+	struct strbuf err = STRBUF_INIT;
+	struct oid_array chunk_oids = OID_ARRAY_INIT;
+	int ret = 0;
+	
+	
 	if (object_on_skiplist(options, oid))
 		return 0;
 
-	/* For now, manifests are valid if they exist */
-	return 0;
+	/* Step 1: Validate manifest header structure */
+	int validation_result = validate_manifest_header(the_repository, buf, size, &header, &err);
+	
+	if (validation_result < 0) {
+		const char *error_msg = err.buf;
+		
+		/* Map generic errors to specific fsck message IDs */
+		if (strstr(error_msg, "missing version"))
+			ret = report(options, oid, OBJ_MANIFEST, FSCK_MSG_MANIFEST_MISSING_VERSION, "%s", error_msg);
+		else if (strstr(error_msg, "invalid version"))
+			ret = report(options, oid, OBJ_MANIFEST, FSCK_MSG_MANIFEST_INVALID_VERSION, "%s", error_msg);
+		else if (strstr(error_msg, "version") && strstr(error_msg, "newer than supported"))
+			ret = report(options, oid, OBJ_MANIFEST, FSCK_MSG_MANIFEST_INVALID_VERSION, "%s", error_msg);
+		else if (strstr(error_msg, "missing total size"))
+			ret = report(options, oid, OBJ_MANIFEST, FSCK_MSG_MANIFEST_MISSING_SIZE, "%s", error_msg);
+		else if (strstr(error_msg, "missing.*content OID"))
+			ret = report(options, oid, OBJ_MANIFEST, FSCK_MSG_MANIFEST_MISSING_CONTENT_OID, "%s", error_msg);
+		else if (strstr(error_msg, "missing chunk count"))
+			ret = report(options, oid, OBJ_MANIFEST, FSCK_MSG_MANIFEST_MISSING_CHUNK_COUNT, "%s", error_msg);
+		else if (strstr(error_msg, "zero chunks"))
+			ret = report(options, oid, OBJ_MANIFEST, FSCK_MSG_MANIFEST_INVALID_CHUNK_COUNT, "%s", error_msg);
+		else if (strstr(error_msg, "too short"))
+			ret = report(options, oid, OBJ_MANIFEST, FSCK_MSG_MANIFEST_CHUNK_DATA_TOO_SHORT, "%s", error_msg);
+		else
+			ret = report(options, oid, OBJ_MANIFEST, FSCK_MSG_BAD_TYPE, "%s", error_msg);
+		
+		goto cleanup;
+	}
+	
+	/* Step 2: Extract chunk OIDs for validation */
+	if (get_manifest_chunk_oids(the_repository, oid, NULL, &chunk_oids) < 0) {
+		ret = report(options, oid, OBJ_MANIFEST, FSCK_MSG_BAD_TYPE, "failed to extract chunk OIDs");
+		goto cleanup;
+	}
+	
+	/* Step 3: Validate that all chunk objects exist and are blobs */
+	strbuf_reset(&err);
+	if (validate_manifest_chunks(the_repository, chunk_oids.oid, chunk_oids.nr, &err) < 0) {
+		const char *error_msg = err.buf;
+		
+		if (strstr(error_msg, "not found"))
+			ret = report(options, oid, OBJ_MANIFEST, FSCK_MSG_MANIFEST_CHUNK_MISSING, "%s", error_msg);
+		else if (strstr(error_msg, "expected blob"))
+			ret = report(options, oid, OBJ_MANIFEST, FSCK_MSG_MANIFEST_CHUNK_WRONG_TYPE, "%s", error_msg);
+		else
+			ret = report(options, oid, OBJ_MANIFEST, FSCK_MSG_BAD_TYPE, "%s", error_msg);
+		
+		goto cleanup;
+	}
+	
+	/* Step 4: Verify data integrity (expensive, but thorough) */
+	if (options->strict) {
+		strbuf_reset(&err);
+		if (verify_manifest_integrity(the_repository, &header, chunk_oids.oid, &err) < 0) {
+			const char *error_msg = err.buf;
+			
+			if (strstr(error_msg, "size mismatch"))
+				ret = report(options, oid, OBJ_MANIFEST, FSCK_MSG_MANIFEST_SIZE_MISMATCH, "%s", error_msg);
+			else if (strstr(error_msg, "content.*mismatch"))
+				ret = report(options, oid, OBJ_MANIFEST, FSCK_MSG_MANIFEST_CONTENT_MISMATCH, "%s", error_msg);
+			else
+				ret = report(options, oid, OBJ_MANIFEST, FSCK_MSG_BAD_TYPE, "%s", error_msg);
+			
+			goto cleanup;
+		}
+	}
+	
+cleanup:
+	strbuf_release(&err);
+	oid_array_clear(&chunk_oids);
+	return ret;
 }
 
 int fsck_buffer(const struct object_id *oid, enum object_type type,

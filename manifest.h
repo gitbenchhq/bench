@@ -143,4 +143,48 @@ int get_manifest_size(struct repository *r,
                      const struct object_id *manifest_oid,
                      unsigned long *size);
 
+/* Validation functions for fsck */
+struct strbuf;
+
+/* Manifest header structure for validation */
+struct manifest_header {
+	int version;
+	unsigned long total_size;
+	struct object_id content_oid;  /* OID of complete file content (after filters) */
+	size_t chunk_count;
+	const char *chunk_data;  /* Pointer to start of chunk OID data */
+	size_t chunk_data_len;   /* Length of chunk OID data in bytes */
+};
+
+/**
+ * Validate manifest header structure and report errors to buffer.
+ * This is similar to parse_manifest_header but reports validation errors
+ * to err buffer instead of calling error() directly.
+ * Returns 0 on success, -1 on error.
+ **/
+int validate_manifest_header(struct repository *r, const void *buffer, unsigned long size,
+                           struct manifest_header *header,
+                           struct strbuf *err);
+
+/**
+ * Verify that all chunk OIDs in a manifest exist and are blobs.
+ * Returns 0 if all chunks are valid, -1 if any are missing or wrong type.
+ * Errors are reported to err buffer.
+ **/
+int validate_manifest_chunks(struct repository *r,
+                           const struct object_id *chunk_oids,
+                           size_t chunk_count,
+                           struct strbuf *err);
+
+/**
+ * Verify manifest data integrity by checking that chunk hashes match content.
+ * This validates that the content_oid matches the hash of concatenated chunks.
+ * Returns 0 if integrity check passes, -1 on error.
+ * Errors are reported to err buffer.
+ **/
+int verify_manifest_integrity(struct repository *r,
+                            const struct manifest_header *header,
+                            const struct object_id *chunk_oids,
+                            struct strbuf *err);
+
 #endif /* MANIFEST_H */

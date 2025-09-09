@@ -1319,7 +1319,21 @@ int index_path(struct index_state *istate, struct object_id *oid,
 			 * Currently we create a single chunk containing the entire file.
 			 */
 			if (flags & INDEX_WRITE_OBJECT) {
-				/* For single chunk, content OID equals chunk OID */
+				/* 
+				 * For single chunk, content OID equals chunk OID.
+				 * 
+				 * FUTURE MULTI-CHUNK IMPLEMENTATION:
+				 * For multiple chunks, content_oid should be computed as:
+				 * content_oid = hash(blob_obj1 + blob_obj2 + ... + blob_objN)
+				 * where blob_objX = "blob <size>\0<content>" for each chunk.
+				 * 
+				 * This can be computed efficiently during chunking:
+				 * 1. Initialize content_hash_ctx
+				 * 2. For each chunk:
+				 *    - Create chunk blob object  
+				 *    - Add complete blob object (with header) to content_hash_ctx
+				 * 3. Finalize content_hash_ctx to get content_oid
+				 */
 				if (write_manifest_object(repo, oid, st->st_size, &chunk_oid, 1, &chunk_oid) < 0)
 					rc = error(_("%s: failed to create manifest"), path);
 			} else {

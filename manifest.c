@@ -14,6 +14,8 @@
 #include "write-or-die.h"
 #include "oid-array.h"
 #include "environment.h"
+#include "object-name.h"
+#include "object.h"
 
 const char *manifest_type = "manifest";
 
@@ -61,15 +63,7 @@ struct manifest_stream {
 	int at_end;
 };
 
-/* Internal structure for parsed manifest header */
-struct manifest_header {
-	int version;
-	unsigned long total_size;
-	struct object_id content_oid;  /* OID of complete file content (after filters) */
-	size_t chunk_count;
-	const char *chunk_data;  /* Pointer to start of chunk OID data */
-	size_t chunk_data_len;   /* Length of chunk OID data */
-};
+/* manifest_header struct is now defined in manifest.h */
 
 /*
  * Parse manifest header from buffer.
@@ -608,5 +602,201 @@ int get_manifest_size(struct repository *r,
 	
 	*size = header.total_size;
 	free(manifest_buffer);
+	return 0;
+}
+
+/* Validation functions for fsck */
+
+int validate_manifest_header(struct repository *r, const void *buffer, unsigned long size,
+                           struct manifest_header *header,
+                           struct strbuf *err)
+{
+	const char *p = buffer;
+	const char *end = (const char *)buffer + size;
+	
+	/* Parse version */
+	header->version = strtol(p, (char **)&p, 10);
+	if (p >= end || *p++ != '\n') {
+		strbuf_addstr(err, "manifest missing version number");
+		return -1;
+	}
+	
+	/* Version check: We currently only support version 1 */
+	if (header->version < 1) {
+		strbuf_addf(err, "manifest has invalid version %d", header->version);
+		return -1;
+	}
+	if (header->version > 1) {
+		strbuf_addf(err, "manifest version %d is newer than supported version 1", header->version);
+		return -1;
+	}
+	
+	/* Version 1 parsing */
+	if (header->version == 1) {
+		/* Parse total size - check for negative values first */
+		if (*p == '-') {
+			strbuf_addstr(err, "manifest has invalid negative size");
+			return -1;
+		}
+		header->total_size = strtoul(p, (char **)&p, 10);
+		if (p >= end || *p++ != '\n') {
+			strbuf_addstr(err, "manifest missing total size");
+			return -1;
+		}
+		
+		/* Parse content OID (complete file hash after filters) */
+		int algo_idx = get_oid_hex_any(p, &header->content_oid);
+		if (algo_idx == GIT_HASH_UNKNOWN) {
+			strbuf_addstr(err, "manifest missing or invalid content OID");
+			return -1;
+		}
+		p += hash_algos[algo_idx].hexsz;
+		if (p >= end || *p++ != '\n') {
+			strbuf_addstr(err, "manifest content OID not followed by newline");
+			return -1;
+		}
+		
+		/* Parse chunk count */
+		header->chunk_count = strtoul(p, (char **)&p, 10);
+		if (p >= end || *p++ != '\n') {
+			strbuf_addstr(err, "manifest missing chunk count");
+			return -1;
+		}
+		
+		/* Validate chunk count is reasonable */
+		if (header->chunk_count == 0) {
+			strbuf_addstr(err, "manifest has zero chunks");
+			return -1;
+		}
+	}
+	
+	/* Set pointer to chunk OID data */
+	header->chunk_data = p;
+	header->chunk_data_len = end - p;
+	
+	/* Validate chunk data length matches expected chunk count */
+	size_t expected_chunk_data_len = header->chunk_count * (r->hash_algo->hexsz + 1);  /* +1 for newlines */
+	if (header->chunk_data_len < expected_chunk_data_len - 1) {  /* -1 for last newline */
+		strbuf_addf(err, "manifest chunk data too short (expected %zu, got %zu)", 
+		           expected_chunk_data_len - 1, header->chunk_data_len);
+		return -1;
+	}
+	
+	return 0;
+}
+
+int validate_manifest_chunks(struct repository *r,
+                           const struct object_id *chunk_oids,
+                           size_t chunk_count,
+                           struct strbuf *err)
+{
+	size_t i;
+	
+	for (i = 0; i < chunk_count; i++) {
+		enum object_type type;
+		
+		/* Check if chunk object exists */
+		type = oid_object_info(r, &chunk_oids[i], NULL);
+		if (type == OBJ_BAD) {
+			strbuf_addf(err, "chunk %zu object %s not found", 
+			           i, oid_to_hex(&chunk_oids[i]));
+			return -1;
+		}
+		
+		/* Verify chunk is a blob */
+		if (type != OBJ_BLOB) {
+			strbuf_addf(err, "chunk %zu object %s is %s, expected blob",
+			           i, oid_to_hex(&chunk_oids[i]), type_name(type));
+			return -1;
+		}
+	}
+	
+	return 0;
+}
+
+int verify_manifest_integrity(struct repository *r,
+                            const struct manifest_header *header,
+                            const struct object_id *chunk_oids,
+                            struct strbuf *err)
+{
+	size_t i;
+	unsigned long total_chunk_size = 0;
+	struct git_hash_ctx ctx;
+	struct object_id computed_oid;
+	
+	/* Initialize computed_oid structure */
+	oidclr(&computed_oid, r->hash_algo);
+	
+	/* Initialize hash context for content OID computation */
+	r->hash_algo->init_fn(&ctx);
+	
+	/* Read each chunk and add complete blob object (with header) to hash */
+	for (i = 0; i < header->chunk_count; i++) {
+		enum object_type type;
+		unsigned long chunk_size;
+		void *chunk_data;
+		struct strbuf blob_object = STRBUF_INIT;
+		
+		/* Read chunk data */
+		chunk_data = odb_read_object(r->objects, &chunk_oids[i], &type, &chunk_size);
+		if (!chunk_data) {
+			strbuf_addf(err, "failed to read chunk %zu object %s", 
+			           i, oid_to_hex(&chunk_oids[i]));
+			return -1;
+		}
+		
+		if (type != OBJ_BLOB) {
+			strbuf_addf(err, "chunk %zu object %s is not a blob", 
+			           i, oid_to_hex(&chunk_oids[i]));
+			free(chunk_data);
+			return -1;
+		}
+		
+		/* 
+		 * For content OID computation, we need to hash the complete blob objects.
+		 * Rather than manually reconstructing "blob N\0<content>", we can 
+		 * leverage Git's existing hash_object_file() function.
+		 */
+		struct object_id chunk_as_blob_oid;
+		hash_object_file(r->hash_algo, chunk_data, chunk_size, OBJ_BLOB, &chunk_as_blob_oid);
+		
+		/* Verify this matches the expected chunk OID */
+		if (!oideq(&chunk_oids[i], &chunk_as_blob_oid)) {
+			strbuf_addf(err, "chunk %zu OID mismatch: expected %s, computed %s", 
+			           i, oid_to_hex(&chunk_oids[i]), oid_to_hex(&chunk_as_blob_oid));
+			free(chunk_data);
+			return -1;
+		}
+		
+		/* Add the blob object's serialized form to content hash
+		 * Format: "blob <size>\0<content>" */
+		strbuf_addf(&blob_object, "blob %lu", chunk_size);
+		strbuf_addch(&blob_object, '\0');
+		strbuf_add(&blob_object, chunk_data, chunk_size);
+		
+		git_hash_update(&ctx, blob_object.buf, blob_object.len);
+		total_chunk_size += chunk_size;
+		
+		strbuf_release(&blob_object);
+		free(chunk_data);
+	}
+	
+	/* Finalize hash computation */
+	git_hash_final(computed_oid.hash, &ctx);
+	
+	/* Verify total size matches header */
+	if (total_chunk_size != header->total_size) {
+		strbuf_addf(err, "manifest total size mismatch: header says %lu, chunks sum to %lu",
+		           header->total_size, total_chunk_size);
+		return -1;
+	}
+	
+	/* Verify content OID matches computed hash */
+	if (!oideq(&computed_oid, &header->content_oid)) {
+		strbuf_addf(err, "manifest content OID mismatch: header says %s, computed %s",
+		           oid_to_hex(&header->content_oid), oid_to_hex(&computed_oid));
+		return -1;
+	}
+	
 	return 0;
 }
