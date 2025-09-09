@@ -491,6 +491,47 @@ static int fsck_walk_tag(struct tag *tag, void *data, struct fsck_options *optio
 	return options->walk(tag->tagged, OBJ_ANY, data, options);
 }
 
+static int fsck_walk_manifest(struct manifest *manifest, void *data, struct fsck_options *options)
+{
+	unsigned long total_size;
+	struct oid_array chunk_oids = OID_ARRAY_INIT;
+	const char *name;
+	int res = 0;
+	int i;
+
+	/* Get manifest name for object naming */
+	name = fsck_get_object_name(options, &manifest->object.oid);
+
+	/* Extract chunk OIDs from manifest */
+	if (get_manifest_chunk_oids(the_repository, &manifest->object.oid, 
+				    &total_size, &chunk_oids) < 0) {
+		oid_array_clear(&chunk_oids);
+		return -1;
+	}
+
+	/* Walk each chunk blob */
+	for (i = 0; i < chunk_oids.nr; i++) {
+		struct object *obj;
+		int result;
+
+		obj = (struct object *)lookup_blob(the_repository, &chunk_oids.oid[i]);
+		if (name && obj)
+			fsck_put_object_name(options, &chunk_oids.oid[i], 
+					     "%s[chunk %d]", name, i);
+
+		result = options->walk(obj, OBJ_BLOB, data, options);
+		if (result < 0) {
+			oid_array_clear(&chunk_oids);
+			return result;
+		}
+		if (!res)
+			res = result;
+	}
+
+	oid_array_clear(&chunk_oids);
+	return res;
+}
+
 int fsck_walk(struct object *obj, void *data, struct fsck_options *options)
 {
 	if (!obj)
@@ -509,7 +550,7 @@ int fsck_walk(struct object *obj, void *data, struct fsck_options *options)
 	case OBJ_TAG:
 		return fsck_walk_tag((struct tag *)obj, data, options);
 	case OBJ_MANIFEST:
-		return 0;
+		return fsck_walk_manifest((struct manifest *)obj, data, options);
 	default:
 		error("Unknown object type for %s",
 		      fsck_describe_object(options, &obj->oid));
