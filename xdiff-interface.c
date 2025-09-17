@@ -8,6 +8,7 @@
 #include "odb.h"
 #include "strbuf.h"
 #include "xdiff-interface.h"
+#include "manifest.h"
 #include "xdiff/xtypes.h"
 #include "xdiff/xdiffi.h"
 #include "xdiff/xutils.h"
@@ -191,6 +192,36 @@ void read_mmblob(mmfile_t *ptr, const struct object_id *oid)
 	if (!ptr->ptr || type != OBJ_BLOB)
 		die("unable to read blob object %s", oid_to_hex(oid));
 	ptr->size = size;
+}
+
+void read_mmmanifest(mmfile_t *ptr, const struct object_id *oid)
+{
+	unsigned long size;
+	enum object_type type;
+
+	if (oideq(oid, null_oid(the_hash_algo))) {
+		ptr->ptr = xstrdup("");
+		ptr->size = 0;
+		return;
+	}
+
+	/* Check object type first */
+	type = odb_read_object_info(the_repository->objects, oid, &size);
+	if (type == OBJ_MANIFEST) {
+		/* Read manifest content */
+		ptr->ptr = read_manifest_content(the_repository, oid, &size);
+		if (!ptr->ptr)
+			die("unable to read manifest object %s", oid_to_hex(oid));
+		ptr->size = size;
+	} else if (type == OBJ_BLOB) {
+		/* Read blob directly */
+		ptr->ptr = odb_read_object(the_repository->objects, oid, &type, &size);
+		if (!ptr->ptr)
+			die("unable to read blob object %s", oid_to_hex(oid));
+		ptr->size = size;
+	} else {
+		die("unable to read file object %s (type %d)", oid_to_hex(oid), type);
+	}
 }
 
 #define FIRST_FEW_BYTES 8000

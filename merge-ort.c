@@ -35,8 +35,10 @@
 #include "hex.h"
 #include "entry.h"
 #include "merge-ll.h"
+#include "manifest.h"
 #include "match-trees.h"
 #include "mem-pool.h"
+#include "object.h"
 #include "object-file.h"
 #include "object-name.h"
 #include "odb.h"
@@ -2098,18 +2100,68 @@ static int merge_3way(struct merge_options *opt,
 		name2 = mkpathdup("%s:%s", opt->branch2,  pathnames[2]);
 	}
 
-	read_mmblob(&orig, o);
-	read_mmblob(&src1, a);
-	read_mmblob(&src2, b);
+	/* Initialize mmfile_t structures to ensure safe cleanup */
+	memset(&orig, 0, sizeof(orig));
+	memset(&src1, 0, sizeof(src1));
+	memset(&src2, 0, sizeof(src2));
 
-	merge_status = ll_merge(result_buf, path, &orig, base,
-				&src1, name1, &src2, name2,
-				&opt->priv->attr_index, &ll_opts);
-	if (merge_status == LL_MERGE_BINARY_CONFLICT)
+	/* Check for large manifest files that should be treated as binary */
+	int is_large_manifest = 0;
+
+	if ((o && odb_read_object_info(the_repository->objects, o, NULL) == OBJ_MANIFEST) ||
+	    (a && odb_read_object_info(the_repository->objects, a, NULL) == OBJ_MANIFEST) ||
+	    (b && odb_read_object_info(the_repository->objects, b, NULL) == OBJ_MANIFEST)) {
+		
+		unsigned long logical_size;
+		
+		
+		if (o && odb_read_object_info(the_repository->objects, o, NULL) == OBJ_MANIFEST) {
+			if (get_manifest_size(the_repository, o, &logical_size) >= 0 &&
+			    logical_size > repo_settings_get_big_file_threshold(the_repository)) {
+				is_large_manifest = 1;
+			}
+		}
+		if (!is_large_manifest && a && odb_read_object_info(the_repository->objects, a, NULL) == OBJ_MANIFEST) {
+			if (get_manifest_size(the_repository, a, &logical_size) >= 0 &&
+			    logical_size > repo_settings_get_big_file_threshold(the_repository)) {
+				is_large_manifest = 1;
+			}
+		}
+		if (!is_large_manifest && b && odb_read_object_info(the_repository->objects, b, NULL) == OBJ_MANIFEST) {
+			if (get_manifest_size(the_repository, b, &logical_size) >= 0 &&
+			    logical_size > repo_settings_get_big_file_threshold(the_repository)) {
+				is_large_manifest = 1;
+			}
+		}
+		
+		if (is_large_manifest) {
+			merge_status = LL_MERGE_BINARY_CONFLICT;
+			
+			/* For large manifests, provide minimal result_buf to avoid loading full content.
+			 * Like ll_binary_merge, we choose "ours" (src1/a) for binary conflicts.
+			 * The actual content copying will be handled by the caller using the OID.
+			 */
+			result_buf->ptr = xstrdup("");
+			result_buf->size = 0;
+		}
+	}
+
+	if (!is_large_manifest) {
+		read_mmmanifest(&orig, o);
+		read_mmmanifest(&src1, a);
+		read_mmmanifest(&src2, b);
+
+		merge_status = ll_merge(result_buf, path, &orig, base,
+					&src1, name1, &src2, name2,
+					&opt->priv->attr_index, &ll_opts);
+	}
+	
+	if (merge_status == LL_MERGE_BINARY_CONFLICT) {
 		path_msg(opt, CONFLICT_BINARY, 0,
 			 path, NULL, NULL, NULL,
 			 "warning: Cannot merge binary files: %s (%s vs. %s)",
 			 path, name1, name2);
+	}
 
 	free(base);
 	free(name1);
@@ -2157,7 +2209,7 @@ static int handle_content_merge(struct merge_options *opt,
 		result->mode = b->mode;
 	else {
 		/* must be the 100644/100755 case */
-		assert(S_ISREG(a->mode));
+		assert(S_ISREG(a->mode) || S_ISMANIFEST(a->mode));
 		result->mode = a->mode;
 		clean = (b->mode == o->mode);
 		/*
@@ -2190,7 +2242,7 @@ static int handle_content_merge(struct merge_options *opt,
 		oidcpy(&result->oid, &a->oid);
 
 	/* Remaining rules depend on file vs. submodule vs. symlink. */
-	else if (S_ISREG(a->mode)) {
+	else if (S_ISREG(a->mode) || S_ISMANIFEST(a->mode)) {
 		mmbuffer_t result_buf;
 		int ret = 0, merge_status;
 		int two_way;
@@ -2215,13 +2267,20 @@ static int handle_content_merge(struct merge_options *opt,
 			ret = -1;
 		}
 
-		if (!ret && record_object &&
-		    write_object_file(result_buf.ptr, result_buf.size,
-				      OBJ_BLOB, &result->oid)) {
-			path_msg(opt, ERROR_OBJECT_WRITE_FAILED, 0,
-				 pathnames[0], pathnames[1], pathnames[2], NULL,
-				 _("error: unable to add %s to database"), path);
-			ret = -1;
+		if (!ret && record_object) {
+			if (merge_status == LL_MERGE_BINARY_CONFLICT) {
+				/* For large manifests treated as binary conflicts, 
+				 * use existing "ours" OID instead of creating new object.
+				 * This avoids loading large content into memory.
+				 */
+				oidcpy(&result->oid, &a->oid);
+			} else if (write_object_file(result_buf.ptr, result_buf.size,
+					      OBJ_BLOB, &result->oid)) {
+				path_msg(opt, ERROR_OBJECT_WRITE_FAILED, 0,
+					 pathnames[0], pathnames[1], pathnames[2], NULL,
+					 _("error: unable to add %s to database"), path);
+				ret = -1;
+			}
 		}
 		free(result_buf.ptr);
 
@@ -2898,7 +2957,7 @@ static int process_renames(struct merge_options *opt,
 			struct version_info merged;
 			struct conflict_info *base, *side1, *side2;
 			unsigned was_binary_blob = 0;
-			const int record_object = true;
+			const int record_object = 1;
 
 			pathnames[0] = oldpath;
 			pathnames[1] = newpath;
@@ -3012,8 +3071,8 @@ static int process_renames(struct merge_options *opt,
 		source_deleted = (oldinfo->filemask == 1);
 		collision = ((newinfo->filemask & old_sidemask) != 0);
 		type_changed = !source_deleted &&
-			(S_ISREG(oldinfo->stages[other_source_index].mode) !=
-			 S_ISREG(newinfo->stages[target_index].mode));
+			((S_ISREG(oldinfo->stages[other_source_index].mode) || S_ISMANIFEST(oldinfo->stages[other_source_index].mode)) !=
+			 (S_ISREG(newinfo->stages[target_index].mode) || S_ISMANIFEST(newinfo->stages[target_index].mode)));
 		if (type_changed && collision) {
 			/*
 			 * special handling so later blocks can handle this...
@@ -3064,7 +3123,7 @@ static int process_renames(struct merge_options *opt,
 
 			struct conflict_info *base, *side1, *side2;
 			int clean;
-			const int record_object = true;
+			const int record_object = 1;
 
 			pathnames[0] = oldpath;
 			pathnames[other_source_index] = oldpath;
@@ -4145,9 +4204,9 @@ static int process_entry(struct merge_options *opt,
 			new_ci = mem_pool_alloc(&opt->priv->pool,
 						sizeof(*new_ci));
 
-			if (S_ISREG(a_mode))
+			if (S_ISREG(a_mode) || S_ISMANIFEST(a_mode))
 				rename_a = 1;
-			else if (S_ISREG(b_mode))
+			else if (S_ISREG(b_mode) || S_ISMANIFEST(b_mode))
 				rename_b = 1;
 			else {
 				rename_a = 1;
@@ -4367,14 +4426,14 @@ static void prefetch_for_content_merges(struct merge_options *opt,
 
 		/* Ignore entries that don't need a content merge */
 		if (ci->match_mask || ci->filemask < 6 ||
-		    !S_ISREG(ci->stages[1].mode) ||
-		    !S_ISREG(ci->stages[2].mode) ||
+		    !(S_ISREG(ci->stages[1].mode) || S_ISMANIFEST(ci->stages[1].mode)) ||
+		    !(S_ISREG(ci->stages[2].mode) || S_ISMANIFEST(ci->stages[2].mode)) ||
 		    oideq(&ci->stages[1].oid, &ci->stages[2].oid))
 			continue;
 
 		/* Also don't need content merge if base matches either side */
 		if (ci->filemask == 7 &&
-		    S_ISREG(ci->stages[0].mode) &&
+		    (S_ISREG(ci->stages[0].mode) || S_ISMANIFEST(ci->stages[0].mode)) &&
 		    (oideq(&ci->stages[0].oid, &ci->stages[1].oid) ||
 		     oideq(&ci->stages[0].oid, &ci->stages[2].oid)))
 			continue;
@@ -4384,7 +4443,7 @@ static void prefetch_for_content_merges(struct merge_options *opt,
 			struct version_info *vi = &ci->stages[i];
 
 			if ((ci->filemask & side_mask) &&
-			    S_ISREG(vi->mode) &&
+			    (S_ISREG(vi->mode) || S_ISMANIFEST(vi->mode)) &&
 			    odb_read_object_info_extended(opt->repo->objects, &vi->oid, NULL,
 							  OBJECT_INFO_FOR_PREFETCH))
 				oid_array_append(&to_fetch, &vi->oid);

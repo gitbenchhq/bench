@@ -46,6 +46,7 @@ int xdi_diff_outf(mmfile_t *mf1, mmfile_t *mf2,
 		  xpparam_t const *xpp, xdemitconf_t const *xecfg);
 int read_mmfile(mmfile_t *ptr, const char *filename);
 void read_mmblob(mmfile_t *ptr, const struct object_id *oid);
+void read_mmmanifest(mmfile_t *ptr, const struct object_id *oid);
 int buffer_is_binary(const char *ptr, unsigned long size);
 
 void xdiff_set_find_func(xdemitconf_t *xecfg, const char *line, int cflags);
