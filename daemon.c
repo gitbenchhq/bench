@@ -761,7 +761,7 @@ static int execute(void)
 		struct daemon_service *s = &(daemon_service[i]);
 		const char *arg;
 
-		if (skip_prefix(line, "git-", &arg) &&
+		if ((skip_prefix(line, "git-", &arg) || skip_prefix(line, "bench-", &arg)) &&
 		    skip_prefix(arg, s->name, &arg) &&
 		    *arg++ == ' ') {
 			/*

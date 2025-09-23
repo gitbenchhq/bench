@@ -29,6 +29,7 @@
 #include "object-name.h"
 #include "color.h"
 #include "bundle-uri.h"
+#include "repository.h"
 
 static int transport_use_color = -1;
 static char transport_colors[][COLOR_MAXLEN] = {
@@ -306,14 +307,19 @@ static int connect_setup(struct transport *transport, int for_push)
 	case TRANSPORT_FAMILY_IPV6: flags |= CONNECT_IPV6; break;
 	}
 
+	/* Use git- prefix in compatibility mode, bench- prefix in bench mode */
+	const char *service_prefix = repo_has_bench_extensions(the_repository) ? "bench-" : "git-";
+	const char *service_name = for_push ? "receive-pack" : "upload-pack";
+	char *full_service = xstrfmt("%s%s", service_prefix, service_name);
+
 	data->conn = git_connect(data->fd, transport->url,
-				 for_push ?
-					"bench-receive-pack" :
-					"bench-upload-pack",
+				 full_service,
 				 for_push ?
 					data->options.receivepack :
 					data->options.uploadpack,
 				 flags);
+
+	free(full_service);
 
 	return 0;
 }
@@ -1235,10 +1241,12 @@ struct transport *transport_get(struct remote *remote, const char *url)
 
 	if (ret->smart_options) {
 		ret->smart_options->thin = 1;
-		ret->smart_options->uploadpack = "bench-upload-pack";
+		/* Use git- prefix in compatibility mode, bench- prefix in bench mode */
+		const char *service_prefix = repo_has_bench_extensions(the_repository) ? "bench-" : "git-";
+		ret->smart_options->uploadpack = xstrfmt("%supload-pack", service_prefix);
 		if (remote->uploadpack)
 			ret->smart_options->uploadpack = remote->uploadpack;
-		ret->smart_options->receivepack = "bench-receive-pack";
+		ret->smart_options->receivepack = xstrfmt("%sreceive-pack", service_prefix);
 		if (remote->receivepack)
 			ret->smart_options->receivepack = remote->receivepack;
 	}
