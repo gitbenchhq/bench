@@ -19,6 +19,7 @@
 #include "url.h"
 #include "utf8.h"
 #include "manifest.h"
+#include "manifest-walk.h"
 #include "oidset.h"
 #include "oid-array.h"
 #include "packfile.h"
@@ -493,42 +494,53 @@ static int fsck_walk_tag(struct tag *tag, void *data, struct fsck_options *optio
 
 static int fsck_walk_manifest(struct manifest *manifest, void *data, struct fsck_options *options)
 {
-	unsigned long total_size;
-	struct oid_array chunk_oids = OID_ARRAY_INIT;
+	struct manifest_desc desc;
 	const char *name;
 	int res = 0;
-	int i;
+	int chunk_idx = 0;
 
 	/* Get manifest name for object naming */
 	name = fsck_get_object_name(options, &manifest->object.oid);
 
-	/* Extract chunk OIDs from manifest */
-	if (get_manifest_chunk_oids(the_repository, &manifest->object.oid, 
-				    &total_size, &chunk_oids) < 0) {
-		oid_array_clear(&chunk_oids);
-		return -1;
+	/*
+	 * Parse manifest directly from buffer (similar to how fsck_walk_tree
+	 * uses tree->buffer). During index-pack, the manifest object hasn't
+	 * been written to the ODB yet, so we must use the in-memory buffer.
+	 */
+	if (!manifest->buffer) {
+		/*
+		 * Buffer not available - this can happen if the manifest hasn't
+		 * been parsed yet. Try to parse it now.
+		 */
+		if (parse_manifest_buffer(the_repository, manifest, NULL, 0) < 0)
+			return -1;
 	}
 
+	if (!manifest->buffer)
+		return error("manifest %s has no buffer", oid_to_hex(&manifest->object.oid));
+
+	/* Initialize descriptor to iterate through chunk OIDs */
+	init_manifest_desc(&desc, manifest->buffer, manifest->size,
+			   the_repository->hash_algo);
+
 	/* Walk each chunk blob */
-	for (i = 0; i < chunk_oids.nr; i++) {
+	while (manifest_entry(&desc)) {
 		struct object *obj;
 		int result;
 
-		obj = (struct object *)lookup_blob(the_repository, &chunk_oids.oid[i]);
+		obj = (struct object *)lookup_blob(the_repository, &desc.entry_oid);
 		if (name && obj)
-			fsck_put_object_name(options, &chunk_oids.oid[i], 
-					     "%s[chunk %d]", name, i);
+			fsck_put_object_name(options, &desc.entry_oid,
+					     "%s[chunk %d]", name, chunk_idx);
 
 		result = options->walk(obj, OBJ_BLOB, data, options);
-		if (result < 0) {
-			oid_array_clear(&chunk_oids);
+		if (result < 0)
 			return result;
-		}
 		if (!res)
 			res = result;
+		chunk_idx++;
 	}
 
-	oid_array_clear(&chunk_oids);
 	return res;
 }
 
