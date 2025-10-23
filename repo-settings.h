@@ -67,6 +67,11 @@ struct repo_settings {
 	size_t packed_git_limit;
 	unsigned long big_file_threshold;
 
+	/* Content-defined chunking parameters for large files */
+	unsigned long chunk_min_size;
+	unsigned long chunk_target_size;
+	unsigned long chunk_max_size;
+
 	char *hooks_path;
 };
 #define REPO_SETTINGS_INIT { \
@@ -93,6 +98,14 @@ const char *repo_settings_get_hooks_path(struct repository *repo);
 /* Read and set the value for "core.bigFileThreshold". */
 unsigned long repo_settings_get_big_file_threshold(struct repository *repo);
 void repo_settings_set_big_file_threshold(struct repository *repo, unsigned long value);
+
+/* Read and set the values for content-defined chunking. */
+unsigned long repo_settings_get_chunk_min_size(struct repository *repo);
+unsigned long repo_settings_get_chunk_target_size(struct repository *repo);
+unsigned long repo_settings_get_chunk_max_size(struct repository *repo);
+void repo_settings_set_chunk_min_size(struct repository *repo, unsigned long value);
+void repo_settings_set_chunk_target_size(struct repository *repo, unsigned long value);
+void repo_settings_set_chunk_max_size(struct repository *repo, unsigned long value);
 
 /* Read, set or reset the value for "core.sharedRepository". */
 int repo_settings_get_shared_repository(struct repository *repo);

@@ -174,6 +174,64 @@ void repo_settings_set_big_file_threshold(struct repository *repo, unsigned long
 	repo->settings.big_file_threshold = value;
 }
 
+/*
+ * Content-defined chunking configuration
+ *
+ * These settings control how large files are split into chunks:
+ *   - chunk.minSize: Minimum chunk size (prevents excessive fragmentation)
+ *   - chunk.targetSize: Target average chunk size (controls mask granularity)
+ *   - chunk.maxSize: Maximum chunk size (prevents pathologically large chunks)
+ *
+ * Defaults based on genomics file research:
+ *   - min: 2 MB (prevents fragmentation, aligns with BorgBackup)
+ *   - target: 16 MB (optimal for 50-200 GB genomics files)
+ *   - max: 64 MB (reasonable upper bound, memory-safe)
+ *
+ * Users can configure via:
+ *   bench config chunk.minSize 4m
+ *   bench config chunk.targetSize 32m
+ *   bench config chunk.maxSize 128m
+ */
+
+unsigned long repo_settings_get_chunk_min_size(struct repository *repo)
+{
+	if (!repo->settings.chunk_min_size)
+		repo_cfg_ulong(repo, "chunk.minsize",
+			       &repo->settings.chunk_min_size, 2 * 1024 * 1024);
+	return repo->settings.chunk_min_size;
+}
+
+unsigned long repo_settings_get_chunk_target_size(struct repository *repo)
+{
+	if (!repo->settings.chunk_target_size)
+		repo_cfg_ulong(repo, "chunk.targetsize",
+			       &repo->settings.chunk_target_size, 16 * 1024 * 1024);
+	return repo->settings.chunk_target_size;
+}
+
+unsigned long repo_settings_get_chunk_max_size(struct repository *repo)
+{
+	if (!repo->settings.chunk_max_size)
+		repo_cfg_ulong(repo, "chunk.maxsize",
+			       &repo->settings.chunk_max_size, 64 * 1024 * 1024);
+	return repo->settings.chunk_max_size;
+}
+
+void repo_settings_set_chunk_min_size(struct repository *repo, unsigned long value)
+{
+	repo->settings.chunk_min_size = value;
+}
+
+void repo_settings_set_chunk_target_size(struct repository *repo, unsigned long value)
+{
+	repo->settings.chunk_target_size = value;
+}
+
+void repo_settings_set_chunk_max_size(struct repository *repo, unsigned long value)
+{
+	repo->settings.chunk_max_size = value;
+}
+
 enum log_refs_config repo_settings_get_log_all_ref_updates(struct repository *repo)
 {
 	const char *value;
