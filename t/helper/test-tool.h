@@ -3,6 +3,7 @@
 
 #include "git-compat-util.h"
 
+int cmd__add_checkout(int argc, const char **argv);
 int cmd__advise_if_enabled(int argc, const char **argv);
 int cmd__bitmap(int argc, const char **argv);
 int cmd__bloom(int argc, const char **argv);

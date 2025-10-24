@@ -128,7 +128,7 @@ static int test_min_size_exact(void)
 
 	/* Verify results */
 	printf("  Chunks created: %zu\n", sc.chunk_count);
-	printf("  Total size: %lu bytes\n", sc.total_size);
+	printf("  Total size: %"PRIu64" bytes\n", sc.total_size);
 	printf("  Content OID: %s\n", oid_to_hex(&content_oid));
 	printf("  Chunk[0] OID: %s\n", oid_to_hex(&sc.chunk_oids[0]));
 
@@ -221,7 +221,7 @@ static int test_min_size_minus_one(void)
 	}
 
 	printf("  Chunks created: %zu\n", sc.chunk_count);
-	printf("  Total size: %lu bytes\n", sc.total_size);
+	printf("  Total size: %"PRIu64" bytes\n", sc.total_size);
 	printf("  Content OID: %s\n", oid_to_hex(&content_oid));
 
 	compute_expected_content_hash(data, test_size, &expected_oid);
@@ -234,7 +234,7 @@ static int test_min_size_minus_one(void)
 
 	if (sc.total_size != test_size) {
 		fprintf(stderr, "FAIL: Expected size %lu, got %lu\n",
-		        test_size, sc.total_size);
+		        test_size, (unsigned long)sc.total_size);
 		ret = 1;
 	}
 
@@ -310,7 +310,7 @@ static int test_min_size_plus_one(void)
 	}
 
 	printf("  Chunks created: %zu\n", sc.chunk_count);
-	printf("  Total size: %lu bytes\n", sc.total_size);
+	printf("  Total size: %"PRIu64" bytes\n", sc.total_size);
 	printf("  Content OID: %s\n", oid_to_hex(&content_oid));
 
 	compute_expected_content_hash(data, test_size, &expected_oid);
@@ -324,7 +324,7 @@ static int test_min_size_plus_one(void)
 
 	if (sc.total_size != test_size) {
 		fprintf(stderr, "FAIL: Expected size %lu, got %lu\n",
-		        test_size, sc.total_size);
+		        test_size, (unsigned long)sc.total_size);
 		ret = 1;
 	}
 
@@ -398,7 +398,7 @@ static int test_max_size_exact(void)
 	}
 
 	printf("  Chunks created: %zu\n", sc.chunk_count);
-	printf("  Total size: %lu bytes\n", sc.total_size);
+	printf("  Total size: %"PRIu64" bytes\n", sc.total_size);
 	printf("  Content OID: %s\n", oid_to_hex(&content_oid));
 
 	compute_expected_content_hash(data, max_size, &expected_oid);
@@ -481,7 +481,7 @@ static int test_max_size_minus_one(void)
 	}
 
 	printf("  Chunks created: %zu\n", sc.chunk_count);
-	printf("  Total size: %lu bytes\n", sc.total_size);
+	printf("  Total size: %"PRIu64" bytes\n", sc.total_size);
 	printf("  Content OID: %s\n", oid_to_hex(&content_oid));
 
 	compute_expected_content_hash(data, test_size, &expected_oid);
@@ -494,7 +494,7 @@ static int test_max_size_minus_one(void)
 
 	if (sc.total_size != test_size) {
 		fprintf(stderr, "FAIL: Expected size %lu, got %lu\n",
-		        test_size, sc.total_size);
+		        test_size, (unsigned long)sc.total_size);
 		ret = 1;
 	}
 
@@ -563,7 +563,7 @@ static int test_max_size_plus_one(void)
 	}
 
 	printf("  Chunks created: %zu\n", sc.chunk_count);
-	printf("  Total size: %lu bytes\n", sc.total_size);
+	printf("  Total size: %"PRIu64" bytes\n", sc.total_size);
 	printf("  Content OID: %s\n", oid_to_hex(&content_oid));
 
 	/* Print individual chunk sizes */
@@ -582,7 +582,7 @@ static int test_max_size_plus_one(void)
 
 	if (sc.total_size != test_size) {
 		fprintf(stderr, "FAIL: Expected size %lu, got %lu\n",
-		        test_size, sc.total_size);
+		        test_size, (unsigned long)sc.total_size);
 		ret = 1;
 	}
 
@@ -658,8 +658,8 @@ static int test_multi_chunk(void)
 	}
 
 	printf("  Chunks created: %zu\n", sc.chunk_count);
-	printf("  Total size: %lu bytes (%.1fMB)\n", sc.total_size,
-	       sc.total_size / (1024.0 * 1024.0));
+	printf("  Total size: %"PRIu64" bytes (%.1fMB)\n", sc.total_size,
+	       (double)sc.total_size / (1024.0 * 1024.0));
 	printf("  Content OID: %s\n", oid_to_hex(&content_oid));
 	printf("  Manifest OID: %s\n", oid_to_hex(&manifest_oid));
 
@@ -695,7 +695,7 @@ static int test_multi_chunk(void)
 
 	if (sc.total_size != test_size) {
 		fprintf(stderr, "FAIL: Expected size %lu, got %lu\n",
-		        test_size, sc.total_size);
+		        test_size, (unsigned long)sc.total_size);
 		ret = 1;
 	}
 
@@ -773,8 +773,8 @@ static int test_many_chunks(void)
 	}
 
 	printf("  Chunks created: %zu\n", sc.chunk_count);
-	printf("  Total size: %lu bytes (%.1fMB)\n", sc.total_size,
-	       sc.total_size / (1024.0 * 1024.0));
+	printf("  Total size: %"PRIu64" bytes (%.1fMB)\n", sc.total_size,
+	       (double)sc.total_size / (1024.0 * 1024.0));
 	printf("  Content OID: %s\n", oid_to_hex(&content_oid));
 	printf("  Manifest OID: %s\n", oid_to_hex(&manifest_oid));
 
@@ -814,7 +814,7 @@ static int test_many_chunks(void)
 
 	if (sc.total_size != test_size) {
 		fprintf(stderr, "FAIL: Expected size %lu, got %lu\n",
-		        test_size, sc.total_size);
+		        test_size, (unsigned long)sc.total_size);
 		ret = 1;
 	}
 

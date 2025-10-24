@@ -47,7 +47,7 @@ struct streaming_chunker {
 	int content_hash_initialized;    /* Set to 1 after header is hashed */
 
 	/* Total file stats */
-	unsigned long total_size;        /* Total bytes processed */
+	uint64_t total_size;             /* Total bytes processed */
 
 	/* Error handling */
 	int error_occurred;              /* Set to 1 on error */

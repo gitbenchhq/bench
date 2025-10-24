@@ -10,6 +10,7 @@ static const char * const test_tool_usage[] = {
 };
 
 static struct test_cmd cmds[] = {
+	{ "add-checkout", cmd__add_checkout },
 	{ "advise", cmd__advise_if_enabled },
 	{ "bitmap", cmd__bitmap },
 	{ "bloom", cmd__bloom },

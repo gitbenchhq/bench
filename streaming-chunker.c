@@ -71,7 +71,7 @@ int streaming_chunker_init(struct streaming_chunker *sc, int fd, off_t file_size
 	 * This represents what Git would have computed if it hashed the file as one blob.
 	 */
 	struct strbuf header = STRBUF_INIT;
-	strbuf_addf(&header, "blob %lu", (unsigned long)file_size);
+	strbuf_addf(&header, "blob %"PRIuMAX, (uintmax_t)file_size);
 	strbuf_addch(&header, '\0');
 
 	the_hash_algo->init_fn(&sc->content_hash_ctx);
