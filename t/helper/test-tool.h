@@ -71,6 +71,7 @@ int cmd__sha1_unsafe(int argc, const char **argv);
 int cmd__sha256(int argc, const char **argv);
 int cmd__sigchain(int argc, const char **argv);
 int cmd__simple_ipc(int argc, const char **argv);
+int cmd__streaming_chunker(int argc, const char **argv);
 int cmd__string_list(int argc, const char **argv);
 int cmd__submodule(int argc, const char **argv);
 int cmd__submodule_config(int argc, const char **argv);
