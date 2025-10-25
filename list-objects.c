@@ -103,7 +103,8 @@ static void process_tree(struct traversal_context *ctx,
 
 static void process_chunk(struct traversal_context *ctx,
 			 const struct object_id *chunk_oid,
-			 const char *manifest_name);
+			 const char *manifest_name,
+			 int skip_delta);
 
 static void process_manifest(struct traversal_context *ctx,
 			     struct manifest *manifest,
@@ -167,8 +168,17 @@ static void process_manifest(struct traversal_context *ctx,
 	 * its chunks shouldn't be included either.
 	 */
 	if (r & LOFR_DO_SHOW) {
+		/*
+		 * Bench optimization: Skip delta compression for chunks from
+		 * multi-chunk manifests. These are large binary chunks where:
+		 * 1. Delta compression is slow and ineffective
+		 * 2. Chunk deduplication already handles reuse
+		 * Single-chunk manifests (small text files) still get delta compression.
+		 */
+		int skip_delta = (chunk_oids.nr > 1);
+
 		for (i = 0; i < chunk_oids.nr; i++) {
-			process_chunk(ctx, &chunk_oids.oid[i], name);
+			process_chunk(ctx, &chunk_oids.oid[i], name, skip_delta);
 		}
 	}
 	
@@ -178,12 +188,13 @@ static void process_manifest(struct traversal_context *ctx,
 
 static void process_chunk(struct traversal_context *ctx,
 			 const struct object_id *chunk_oid,
-			 const char *manifest_name)
+			 const char *manifest_name,
+			 int skip_delta)
 {
 	struct blob *b = lookup_blob(ctx->revs->repo, chunk_oid);
 	if (!b)
 		return;
-	
+
 	/*
 	 * Chunks are implementation details of manifests.
 	 * They must always be included if their manifest is included.
@@ -191,7 +202,14 @@ static void process_chunk(struct traversal_context *ctx,
 	 * happens at the manifest level based on total file size.
 	 */
 	b->object.flags |= SEEN | NOT_USER_GIVEN;
-	
+
+	/*
+	 * Bench optimization: Mark chunks from multi-chunk manifests to skip
+	 * delta compression. This flag is honored by pack-objects during gc/repack.
+	 */
+	if (skip_delta)
+		b->object.flags |= CHUNK_NO_DELTA;
+
 	/* Include chunk in pack/output if showing objects */
 	if (ctx->show_object)
 		show_object(ctx, &b->object, manifest_name);

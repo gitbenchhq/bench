@@ -52,6 +52,16 @@
 #define NOT_USER_GIVEN	(1u<<25)
 #define TRACK_LINEAR	(1u<<26)
 #define ANCESTRY_PATH	(1u<<27)
+
+/*
+ * Bench-specific: Indicates this blob is a chunk from a multi-chunk manifest.
+ * Such chunks should not be delta-compressed because:
+ * 1. They are large binary chunks (inefficient to delta compress)
+ * 2. Chunk deduplication already handles reuse between versions
+ * Note: Using bit 22 which is within the valid 28-bit flag range.
+ */
+#define CHUNK_NO_DELTA	(1u<<22)
+
 #define ALL_REV_FLAGS	(((1u<<11)-1) | NOT_USER_GIVEN | TRACK_LINEAR | PULL_MERGE)
 
 #define DECORATE_SHORT_REFS	1

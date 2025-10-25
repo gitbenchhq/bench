@@ -2569,10 +2569,25 @@ static void get_object_details(void)
 	for (i = 0; i < to_pack.nr_objects; i++) {
 		struct object_entry *entry = sorted_by_offset[i];
 		check_object(entry, i);
-		if (entry->type_valid &&
-		    oe_size_greater_than(&to_pack, entry,
-					 repo_settings_get_big_file_threshold(the_repository)))
-			entry->no_try_delta = 1;
+		if (entry->type_valid) {
+			/*
+			 * Bench optimization: Skip delta compression for chunks from
+			 * multi-chunk manifests. During traversal, these chunks are
+			 * marked with CHUNK_NO_DELTA flag because:
+			 * 1. They are large binary chunks (delta compression is slow/ineffective)
+			 * 2. Chunk deduplication already handles reuse between versions
+			 */
+			if (oe_type(entry) == OBJ_BLOB) {
+				struct blob *b = lookup_blob(the_repository, &entry->idx.oid);
+				if (b && (b->object.flags & CHUNK_NO_DELTA))
+					entry->no_try_delta = 1;
+			}
+
+			/* Git's standard check: skip delta for objects larger than threshold */
+			if (oe_size_greater_than(&to_pack, entry,
+						 repo_settings_get_big_file_threshold(the_repository)))
+				entry->no_try_delta = 1;
+		}
 		display_progress(progress_state, i + 1);
 	}
 	stop_progress(&progress_state);
@@ -4219,6 +4234,17 @@ static void show_object(struct object *obj, const char *name,
 {
 	add_preferred_base_object(name);
 	add_object_entry(&obj->oid, obj->type, name, 0);
+
+	/*
+	 * Bench optimization: If this blob is marked CHUNK_NO_DELTA during
+	 * traversal (because it's a chunk from a multi-chunk manifest),
+	 * set no_try_delta on the pack entry to skip delta compression.
+	 */
+	if (obj->type == OBJ_BLOB && (obj->flags & CHUNK_NO_DELTA)) {
+		struct object_entry *ent = packlist_find(&to_pack, &obj->oid);
+		if (ent)
+			ent->no_try_delta = 1;
+	}
 
 	if (use_delta_islands) {
 		const char *p;
