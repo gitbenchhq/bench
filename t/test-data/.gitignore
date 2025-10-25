@@ -1,0 +1,22 @@
+# Large test files for Bench Phase 7 testing
+# These files are excluded from Git tracking due to size
+# Download instructions in README.md
+
+# All large binary test files
+*.fastq
+*.fastq.gz
+*.fasta
+*.fasta.gz
+*.fa
+*.fa.gz
+*.fq
+*.fq.gz
+*.bam
+*.sam
+*.vcf
+*.vcf.gz
+*.bin
+*.dat
+
+# Keep only the README
+!README.md

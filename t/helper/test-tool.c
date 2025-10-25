@@ -12,6 +12,7 @@ static const char * const test_tool_usage[] = {
 static struct test_cmd cmds[] = {
 	{ "add-checkout", cmd__add_checkout },
 	{ "advise", cmd__advise_if_enabled },
+	{ "bench-core", cmd__bench_core },
 	{ "bitmap", cmd__bitmap },
 	{ "bloom", cmd__bloom },
 	{ "bundle-uri", cmd__bundle_uri },

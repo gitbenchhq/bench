@@ -787,6 +787,7 @@ TEST_BUILTINS_OBJS += test-bloom.o
 TEST_BUILTINS_OBJS += test-bundle-uri.o
 TEST_BUILTINS_OBJS += test-cache-tree.o
 TEST_BUILTINS_OBJS += test-add-checkout.o
+TEST_BUILTINS_OBJS += test-bench-core.o
 TEST_BUILTINS_OBJS += test-chmtime.o
 TEST_BUILTINS_OBJS += test-chunker.o
 TEST_BUILTINS_OBJS += test-streaming-chunker.o
