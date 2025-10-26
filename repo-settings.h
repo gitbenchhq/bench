@@ -72,6 +72,10 @@ struct repo_settings {
 	unsigned long chunk_target_size;
 	unsigned long chunk_max_size;
 
+	/* Parallel compression settings */
+	unsigned int compression_threads;
+	unsigned long compression_queue_memory;
+
 	char *hooks_path;
 };
 #define REPO_SETTINGS_INIT { \
@@ -106,6 +110,12 @@ unsigned long repo_settings_get_chunk_max_size(struct repository *repo);
 void repo_settings_set_chunk_min_size(struct repository *repo, unsigned long value);
 void repo_settings_set_chunk_target_size(struct repository *repo, unsigned long value);
 void repo_settings_set_chunk_max_size(struct repository *repo, unsigned long value);
+
+/* Read and set the values for parallel compression. */
+unsigned int repo_settings_get_compression_threads(struct repository *repo);
+unsigned long repo_settings_get_compression_queue_memory(struct repository *repo);
+void repo_settings_set_compression_threads(struct repository *repo, unsigned int value);
+void repo_settings_set_compression_queue_memory(struct repository *repo, unsigned long value);
 
 /* Read, set or reset the value for "core.sharedRepository". */
 int repo_settings_get_shared_repository(struct repository *repo);

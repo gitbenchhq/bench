@@ -988,6 +988,7 @@ LIB_OBJS += checkout.o
 LIB_OBJS += chunk-format.o
 LIB_OBJS += chunker.o
 LIB_OBJS += streaming-chunker.o
+LIB_OBJS += parallel-compress.o
 LIB_OBJS += color.o
 LIB_OBJS += column.o
 LIB_OBJS += combine-diff.o
@@ -1481,6 +1482,19 @@ include config.mak.uname
 
 ifdef DEVELOPER
 include config.mak.dev
+endif
+
+# Enable OpenSSL SHA256 by default for better performance
+# SHA-NI hardware acceleration provides 4-7x speedup
+# Can be disabled with NO_OPENSSL or by explicitly setting another SHA256 implementation
+ifndef NO_OPENSSL
+ifndef NETTLE_SHA256
+ifndef GCRYPT_SHA256
+ifndef SHA256_BLK
+	OPENSSL_SHA256 = YesPlease
+endif
+endif
+endif
 endif
 
 GIT-VERSION-FILE: FORCE
@@ -2074,6 +2088,22 @@ else
 	LIB_OBJS += sha256/block/sha256.o
 	BASIC_CFLAGS += -DSHA256_BLK
 endif
+endif
+endif
+
+# Enable SHA-NI hardware acceleration if using OpenSSL SHA256
+# SHA-NI (Intel SHA Extensions) provides 4-7x speedup for SHA256 hashing
+# Requires: Intel processors with SHA-NI (Ice Lake+, Zen+), or compatible CPUs
+# Flags: -msha (SHA-NI), -msse4.1, -mssse3 (required dependencies)
+# Can be disabled with NO_SHA_NI=YesPlease
+ifndef NO_SHA_NI
+ifdef OPENSSL_SHA256
+	# Test if compiler supports SHA-NI flags
+	FLAGS_SHA_NI := -msha -msse4.1 -mssse3
+	CC_SHA_NI_TEST = $(CC) $(FLAGS_SHA_NI) -x c -c -o /dev/null - </dev/null >/dev/null 2>&1
+	ifeq ($(shell $(CC_SHA_NI_TEST) && echo yes),yes)
+		BASIC_CFLAGS += $(FLAGS_SHA_NI)
+	endif
 endif
 endif
 
