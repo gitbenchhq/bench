@@ -1307,24 +1307,160 @@ int index_path(struct index_state *istate, struct object_id *oid,
 
 		if (in_bench_mode) {
 			/*
-			 * In bench mode: create chunks, then manifest.
-			 * Use streaming chunker for large files (> chunk.minSize).
-			 * Use single-chunk approach for small files and empty files.
+			 * Bench mode decision tree:
+			 * 1. Small files (≤ chunk.minSize): Use Git's single-blob path
+			 * 2. Medium files with filters (chunk.minSize < size ≤ 512MB):
+			 *    Load → Filter → Chunk buffer
+			 * 3. Large files with filters (> 512MB): Error + chunk without filter
+			 * 4. Large files without filters (> chunk.minSize): Stream chunk
 			 */
-			if (should_chunk_file(st->st_size)) {
+			if (!should_chunk_file(st->st_size)) {
 				/*
-				 * Large file: use streaming chunker with content-defined chunking.
-				 * This will:
-				 * 1. Read file in 8KB pages
-				 * 2. Detect chunk boundaries using Gear hash
-				 * 3. Write each chunk to ODB as a blob
-				 * 4. Compute content OID incrementally during read
-				 * 5. Create manifest with all chunk OIDs
+				 * Small file or empty file: create single-chunk manifest.
+				 * This is the fast path for files <= chunk.minSize (default 2MB).
+				 */
+				struct object_id chunk_oid;
+				unsigned long chunk_size;
+
+				/* Create the chunk (entire file as one blob) */
+				if (index_fd(istate, &chunk_oid, fd, st, OBJ_BLOB, path, flags) < 0)
+					return error(_("%s: failed to insert chunk into database"),
+						     path);
+
+				/*
+				 * Get the actual size of the chunk (may differ from st->st_size if filters were applied).
+				 * For example, CRLF normalization may reduce file size.
+				 */
+				if (oid_object_info(repo, &chunk_oid, &chunk_size) < 0)
+					return error(_("%s: failed to get chunk size"), path);
+
+				/*
+				 * Create manifest pointing to this single chunk.
+				 * For single chunk, content OID equals chunk OID.
+				 * Use chunk_size (filtered size) not st->st_size (working tree size).
+				 */
+				if (flags & INDEX_WRITE_OBJECT) {
+					if (write_manifest_object(repo, oid, chunk_size, &chunk_oid, 1, &chunk_oid) < 0)
+						rc = error(_("%s: failed to create manifest"), path);
+				} else {
+					/* Just hashing - create manifest hash without writing */
+					if (hash_manifest_object(repo, oid, chunk_size, &chunk_oid, 1, &chunk_oid) < 0)
+						rc = error(_("%s: failed to hash manifest"), path);
+				}
+			} else if (would_convert_to_git(istate, path)) {
+				/*
+				 * Large file with filters: check if manageable (<= 512MB)
+				 */
+				unsigned long big_file_threshold = repo_settings_get_big_file_threshold(repo);
+
+				if (st->st_size <= big_file_threshold) {
+					/*
+					 * Medium file (chunk.minSize < size <= 512MB) with filters:
+					 * Load file → Apply filters → Chunk filtered data
+					 */
+					struct strbuf file_content = STRBUF_INIT;
+					struct strbuf filtered = STRBUF_INIT;
+
+					/* Read entire file into memory */
+					if (strbuf_read(&file_content, fd, st->st_size) < 0) {
+						rc = error_errno(_("%s: failed to read file"), path);
+						strbuf_release(&file_content);
+						close(fd);
+						return rc;
+					}
+					close(fd);  /* Done with file descriptor */
+
+					/* Apply Git's filters (CRLF, ident, clean, etc.) */
+					int conversion_result = convert_to_git(istate, path,
+					                                      file_content.buf, file_content.len,
+					                                      &filtered, get_conv_flags(flags));
+
+					/* Use filtered data if conversion happened, otherwise use original */
+					const char *data_to_chunk = conversion_result && filtered.len > 0
+					                           ? filtered.buf
+					                           : file_content.buf;
+					size_t data_len = conversion_result && filtered.len > 0
+					                 ? filtered.len
+					                 : file_content.len;
+
+					/* Chunk the filtered data using buffer interface */
+					struct streaming_chunker sc;
+					struct object_id content_oid;
+
+					init_gear_table();
+
+					if (streaming_chunker_init_from_buffer(&sc, data_to_chunk, data_len) < 0) {
+						rc = error(_("%s: failed to initialize chunker"), path);
+						goto cleanup_filter;
+					}
+
+					if (streaming_chunker_process_file(&sc) < 0) {
+						rc = error(_("%s: chunking failed: %s"), path,
+						          sc.error_message.buf);
+						streaming_chunker_cleanup(&sc);
+						goto cleanup_filter;
+					}
+
+					if (streaming_chunker_finalize(&sc, oid, &content_oid) < 0) {
+						rc = error(_("%s: failed to create manifest: %s"), path,
+						          sc.error_message.buf);
+						streaming_chunker_cleanup(&sc);
+						goto cleanup_filter;
+					}
+
+					streaming_chunker_cleanup(&sc);
+
+				cleanup_filter:
+					strbuf_release(&filtered);
+					strbuf_release(&file_content);
+
+				} else {
+					/*
+					 * Large file (> 512MB) with filters:
+					 * Show error + stream chunk without filters
+					 */
+					error(_("%s: file larger than %lu MB has text filters configured"),
+					      path, big_file_threshold / (1024 * 1024));
+					error(_("filters will NOT be applied (file too large)"));
+
+					/* Fall through to streaming chunker (no filters) */
+					struct streaming_chunker sc;
+					struct object_id content_oid;
+
+					init_gear_table();
+
+					if (streaming_chunker_init(&sc, fd, st->st_size) < 0) {
+						close(fd);
+						return error(_("%s: failed to initialize chunker"), path);
+					}
+
+					if (streaming_chunker_process_file(&sc) < 0) {
+						rc = error(_("%s: chunking failed: %s"), path,
+						          sc.error_message.buf);
+						streaming_chunker_cleanup(&sc);
+						close(fd);
+						return rc;
+					}
+
+					if (streaming_chunker_finalize(&sc, oid, &content_oid) < 0) {
+						rc = error(_("%s: failed to create manifest: %s"), path,
+						          sc.error_message.buf);
+						streaming_chunker_cleanup(&sc);
+						close(fd);
+						return rc;
+					}
+
+					streaming_chunker_cleanup(&sc);
+					close(fd);
+				}
+			} else {
+				/*
+				 * Large file (> chunk.minSize) without filters:
+				 * Use streaming chunker with content-defined chunking.
 				 */
 				struct streaming_chunker sc;
 				struct object_id content_oid;
 
-				/* Initialize Gear hash table (one-time initialization) */
 				init_gear_table();
 
 				if (streaming_chunker_init(&sc, fd, st->st_size) < 0) {
@@ -1350,30 +1486,6 @@ int index_path(struct index_state *istate, struct object_id *oid,
 
 				streaming_chunker_cleanup(&sc);
 				close(fd);
-			} else {
-				/*
-				 * Small file or empty file: create single-chunk manifest.
-				 * This is the fast path for files <= chunk.minSize (default 2MB).
-				 */
-				struct object_id chunk_oid;
-
-				/* Create the chunk (entire file as one blob) */
-				if (index_fd(istate, &chunk_oid, fd, st, OBJ_BLOB, path, flags) < 0)
-					return error(_("%s: failed to insert chunk into database"),
-						     path);
-
-				/*
-				 * Create manifest pointing to this single chunk.
-				 * For single chunk, content OID equals chunk OID.
-				 */
-				if (flags & INDEX_WRITE_OBJECT) {
-					if (write_manifest_object(repo, oid, st->st_size, &chunk_oid, 1, &chunk_oid) < 0)
-						rc = error(_("%s: failed to create manifest"), path);
-				} else {
-					/* Just hashing - create manifest hash without writing */
-					if (hash_manifest_object(repo, oid, st->st_size, &chunk_oid, 1, &chunk_oid) < 0)
-						rc = error(_("%s: failed to hash manifest"), path);
-				}
 			}
 		} else {
 			/* Traditional git mode: create blob directly */

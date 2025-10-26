@@ -323,34 +323,102 @@ int stream_manifest_to_fd_filtered(struct repository *r, int fd,
 		if (bytes_read < 0)
 			result = -1;
 	} else {
-		/* Apply filters while streaming */
-		while ((bytes_read = read_manifest_stream(stream, ibuf, sizeof(ibuf))) > 0) {
-			size_t to_feed = bytes_read;
-			size_t to_receive = sizeof(obuf);
-			
-			if (stream_filter(filter, ibuf, &to_feed, obuf, &to_receive)) {
-				result = -1;
-				break;
+		/*
+		 * Apply filters while streaming.
+		 *
+		 * The filter may not consume all input in one call (it might buffer
+		 * for look-ahead). We need to keep feeding unconsumed input along with
+		 * new input until everything is consumed.
+		 */
+		size_t unconsumed = 0;  /* Bytes not yet consumed by filter */
+
+		while ((bytes_read = read_manifest_stream(stream,
+		                                          ibuf + unconsumed,
+		                                          sizeof(ibuf) - unconsumed)) > 0) {
+			size_t total_available = unconsumed + bytes_read;
+			const char *input_ptr = ibuf;
+
+			/* Keep filtering until all input is consumed or output buffer fills */
+			while (total_available > 0) {
+				size_t to_feed = total_available;
+				size_t to_receive = sizeof(obuf);
+
+				if (stream_filter(filter, input_ptr, &to_feed, obuf, &to_receive)) {
+					result = -1;
+					goto cleanup_filter;
+				}
+
+				/* Write any filtered output */
+				size_t filtered_size = sizeof(obuf) - to_receive;
+				if (filtered_size > 0) {
+					if (write_in_full(fd, obuf, filtered_size) < 0) {
+						result = -1;
+						goto cleanup_filter;
+					}
+				}
+
+				/* Update for consumed input */
+				size_t consumed = total_available - to_feed;
+				input_ptr += consumed;
+				total_available = to_feed;
+
+				/* If filter didn't consume anything and didn't produce output,
+				 * we need more input - break inner loop to read more data */
+				if (consumed == 0 && filtered_size == 0)
+					break;
 			}
-			
-			size_t filtered_size = sizeof(obuf) - to_receive;
-			if (filtered_size > 0 && write_in_full(fd, obuf, filtered_size) < 0) {
+
+			/* Move unconsumed data to start of buffer for next iteration */
+			if (total_available > 0 && total_available < sizeof(ibuf)) {
+				memmove(ibuf, input_ptr, total_available);
+				unconsumed = total_available;
+			} else if (total_available >= sizeof(ibuf)) {
+				/* Buffer full with unconsumed data - should not happen with 16KB buffer */
+				warning("manifest streaming: input buffer exhausted, filter needs too much buffering");
 				result = -1;
-				break;
-			}
-			
-			/* Handle any unconsumed input */
-			if (to_feed > 0) {
-				/* This shouldn't happen with our simple streaming,
-				 * but if it does, we'd need more complex buffering */
-				warning("manifest streaming: filter did not consume all input");
+				goto cleanup_filter;
+			} else {
+				unconsumed = 0;
 			}
 		}
-		
-		if (bytes_read < 0)
+
+		if (bytes_read < 0) {
 			result = -1;
-		
-		/* Drain any remaining filtered output */
+			goto cleanup_filter;
+		}
+
+		/* Process any remaining unconsumed data */
+		if (unconsumed > 0 && result == 0) {
+			const char *input_ptr = ibuf;
+			size_t remaining = unconsumed;
+
+			while (remaining > 0) {
+				size_t to_feed = remaining;
+				size_t to_receive = sizeof(obuf);
+
+				if (stream_filter(filter, input_ptr, &to_feed, obuf, &to_receive)) {
+					result = -1;
+					goto cleanup_filter;
+				}
+
+				size_t filtered_size = sizeof(obuf) - to_receive;
+				if (filtered_size > 0) {
+					if (write_in_full(fd, obuf, filtered_size) < 0) {
+						result = -1;
+						goto cleanup_filter;
+					}
+				}
+
+				size_t consumed = remaining - to_feed;
+				input_ptr += consumed;
+				remaining = to_feed;
+
+				if (consumed == 0 && filtered_size == 0)
+					break;  /* Can't make progress */
+			}
+		}
+
+		/* Drain any remaining filtered output (finalize filter) */
 		if (result == 0) {
 			size_t to_receive = sizeof(obuf);
 			if (stream_filter(filter, NULL, NULL, obuf, &to_receive) == 0) {
@@ -359,7 +427,8 @@ int stream_manifest_to_fd_filtered(struct repository *r, int fd,
 					result = -1;
 			}
 		}
-		
+
+	cleanup_filter:
 		free_stream_filter(filter);
 	}
 	
@@ -561,21 +630,21 @@ void *read_manifest_content(struct repository *r,
 	
 	content = xmalloc(manifest_size);
 	while (total_read < manifest_size) {
-		bytes_read = read_manifest_stream(stream, 
+		bytes_read = read_manifest_stream(stream,
 		                                  (char *)content + total_read,
 		                                  manifest_size - total_read);
 		if (bytes_read <= 0)
 			break;
 		total_read += bytes_read;
 	}
-	
+
 	close_manifest_stream(stream);
-	
+
 	if (total_read == manifest_size) {
 		*size = manifest_size;
 		return content;
 	}
-	
+
 	free(content);
 	return NULL;
 }

@@ -55,9 +55,14 @@ struct async_hasher {
  * Streaming chunker state
  */
 struct streaming_chunker {
-	/* Input streaming */
-	int fd;                          /* File descriptor to read from */
+	/* Input streaming - file mode */
+	int fd;                          /* File descriptor to read from (-1 if using buffer) */
 	unsigned char read_buffer[STREAMING_BUFFER_SIZE];
+
+	/* Input streaming - buffer mode */
+	const char *buffer;              /* Source buffer (if fd == -1) */
+	size_t buffer_len;               /* Total buffer size */
+	size_t buffer_pos;               /* Current read position in buffer */
 
 	/* Chunker state */
 	struct chunk_config chunk_config; /* Chunking configuration */
@@ -98,6 +103,21 @@ struct streaming_chunker {
  * Returns 0 on success, -1 on error
  */
 int streaming_chunker_init(struct streaming_chunker *sc, int fd, off_t file_size);
+
+/*
+ * Initialize a streaming chunker from a memory buffer
+ *
+ * This is used when we've already loaded and filtered a file into memory
+ * (e.g., for medium-sized files with text filters applied).
+ *
+ * @param sc Streaming chunker state to initialize
+ * @param data Pointer to buffer containing file data
+ * @param len Length of buffer in bytes
+ *
+ * Returns 0 on success, -1 on error
+ */
+int streaming_chunker_init_from_buffer(struct streaming_chunker *sc,
+                                        const char *data, size_t len);
 
 /*
  * Stream the entire file, creating chunks and storing them in ODB

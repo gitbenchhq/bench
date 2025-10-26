@@ -177,12 +177,11 @@ int should_chunk_file(off_t file_size)
 	return file_size > threshold;
 }
 
-int streaming_chunker_init(struct streaming_chunker *sc, int fd, off_t file_size)
+/*
+ * Common initialization logic for both file and buffer modes
+ */
+static int streaming_chunker_init_common(struct streaming_chunker *sc, size_t data_size)
 {
-	memset(sc, 0, sizeof(*sc));
-
-	sc->fd = fd;
-
 	/*
 	 * Initialize chunk configuration from repository settings.
 	 * This reads from config values:
@@ -213,12 +212,12 @@ int streaming_chunker_init(struct streaming_chunker *sc, int fd, off_t file_size
 	strbuf_init(&sc->error_message, 0);
 
 	/*
-	 * Initialize content hash for the entire file.
-	 * This computes: hash("blob <file_size>\0" + entire_file_data)
-	 * This represents what Git would have computed if it hashed the file as one blob.
+	 * Initialize content hash for the entire data.
+	 * This computes: hash("blob <data_size>\0" + data)
+	 * This represents what Git would have computed if it hashed the data as one blob.
 	 */
 	struct strbuf header = STRBUF_INIT;
-	strbuf_addf(&header, "blob %"PRIuMAX, (uintmax_t)file_size);
+	strbuf_addf(&header, "blob %zu", data_size);
 	strbuf_addch(&header, '\0');
 
 	the_hash_algo->init_fn(&sc->content_hash_ctx);
@@ -254,6 +253,33 @@ int streaming_chunker_init(struct streaming_chunker *sc, int fd, off_t file_size
 	}
 
 	return 0;
+}
+
+int streaming_chunker_init(struct streaming_chunker *sc, int fd, off_t file_size)
+{
+	memset(sc, 0, sizeof(*sc));
+
+	/* File mode: set file descriptor */
+	sc->fd = fd;
+	sc->buffer = NULL;
+	sc->buffer_len = 0;
+	sc->buffer_pos = 0;
+
+	return streaming_chunker_init_common(sc, (size_t)file_size);
+}
+
+int streaming_chunker_init_from_buffer(struct streaming_chunker *sc,
+                                        const char *data, size_t len)
+{
+	memset(sc, 0, sizeof(*sc));
+
+	/* Buffer mode: set buffer parameters, fd = -1 signals buffer mode */
+	sc->fd = -1;
+	sc->buffer = data;
+	sc->buffer_len = len;
+	sc->buffer_pos = 0;
+
+	return streaming_chunker_init_common(sc, len);
 }
 
 /*
@@ -427,18 +453,34 @@ int streaming_chunker_process_file(struct streaming_chunker *sc)
 	double t_start, t_end;
 
 	while (1) {
-		/* Read next page from file */
+		/* Read next page from file or buffer */
 		t_start = get_time_ms();
-		bytes_read = xread(sc->fd, sc->read_buffer, STREAMING_BUFFER_SIZE);
+
+		if (sc->fd >= 0) {
+			/* File mode: read from file descriptor */
+			bytes_read = xread(sc->fd, sc->read_buffer, STREAMING_BUFFER_SIZE);
+			if (bytes_read < 0) {
+				strbuf_addf(&sc->error_message, "failed to read file: %s",
+				            strerror(errno));
+				sc->error_occurred = 1;
+				return -1;
+			}
+		} else {
+			/* Buffer mode: read from memory buffer */
+			size_t remaining = sc->buffer_len - sc->buffer_pos;
+			if (remaining == 0) {
+				bytes_read = 0;  /* EOF */
+			} else {
+				bytes_read = remaining < STREAMING_BUFFER_SIZE
+				           ? remaining
+				           : STREAMING_BUFFER_SIZE;
+				memcpy(sc->read_buffer, sc->buffer + sc->buffer_pos, bytes_read);
+				sc->buffer_pos += bytes_read;
+			}
+		}
+
 		t_end = get_time_ms();
 		time_read_ms += (t_end - t_start);
-
-		if (bytes_read < 0) {
-			strbuf_addf(&sc->error_message, "failed to read file: %s",
-			            strerror(errno));
-			sc->error_occurred = 1;
-			return -1;
-		}
 
 		if (bytes_read == 0)
 			break;  /* EOF */
