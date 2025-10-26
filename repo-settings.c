@@ -5,7 +5,6 @@
 #include "midx.h"
 #include "pack-objects.h"
 #include "setup.h"
-#include "parallel-compress.h"
 
 static void repo_cfg_bool(struct repository *r, const char *key, int *dest,
 			  int def)
@@ -231,88 +230,6 @@ void repo_settings_set_chunk_target_size(struct repository *repo, unsigned long 
 void repo_settings_set_chunk_max_size(struct repository *repo, unsigned long value)
 {
 	repo->settings.chunk_max_size = value;
-}
-
-/*
- * Parallel compression configuration
- *
- * These settings control parallel zlib compression:
- *   - core.compressionThreads: Number of worker threads for compression
- *   - core.compressionQueueMemory: Maximum memory (MB) for compression queue
- *
- * Defaults:
- *   - threads: Half of available CPUs (leaves headroom for I/O)
- *   - queue memory: 1/8 of total system memory (balances performance and memory usage)
- *
- * Users can configure via:
- *   bench config core.compressionThreads 8
- *   bench config core.compressionQueueMemory 1024
- */
-
-unsigned int repo_settings_get_compression_threads(struct repository *repo)
-{
-	if (!repo->settings.compression_threads) {
-		int value;
-		if (!repo_config_get_int(repo, "core.compressionthreads", &value) &&
-		    value > 0) {
-			repo->settings.compression_threads = (unsigned int)value;
-		} else {
-			/*
-			 * Auto-detect optimal thread count based on:
-			 * 1. Available CPU cores (use half)
-			 * 2. Available memory (queue must hold 2x chunks per thread)
-			 *
-			 * Formula: threads = min(cpus/2, queue_memory/(max_chunk_size*2))
-			 */
-			int ncpus = online_cpus();
-			unsigned int cpu_threads = ncpus > 1 ? ncpus / 2 : 1;
-
-			/* Get queue memory (auto-detects to 1/8 total RAM) */
-			unsigned long queue_memory_mb = repo_settings_get_compression_queue_memory(repo);
-			unsigned long max_chunk_mb = repo_settings_get_chunk_max_size(repo) / (1024 * 1024);
-
-			/* How many threads can queue_memory support? (2x chunks per thread) */
-			unsigned int memory_threads = (unsigned int)(queue_memory_mb / (max_chunk_mb * 2));
-			if (memory_threads < 1)
-				memory_threads = 1;
-
-			/* Use smaller of CPU-based vs memory-based limit */
-			repo->settings.compression_threads = cpu_threads < memory_threads
-			                                     ? cpu_threads
-			                                     : memory_threads;
-		}
-	}
-	return repo->settings.compression_threads;
-}
-
-unsigned long repo_settings_get_compression_queue_memory(struct repository *repo)
-{
-	if (!repo->settings.compression_queue_memory) {
-		unsigned long value;
-		if (!repo_config_get_ulong(repo, "core.compressionqueuememory", &value)) {
-			repo->settings.compression_queue_memory = value;
-		} else {
-			/* Auto-detect: use 1/8 of total system memory */
-			unsigned long total_ram_mb = get_total_memory_mb();
-			if (total_ram_mb > 0) {
-				repo->settings.compression_queue_memory = total_ram_mb / 8;
-			} else {
-				/* Fallback if can't detect RAM */
-				repo->settings.compression_queue_memory = 512;
-			}
-		}
-	}
-	return repo->settings.compression_queue_memory;
-}
-
-void repo_settings_set_compression_threads(struct repository *repo, unsigned int value)
-{
-	repo->settings.compression_threads = value;
-}
-
-void repo_settings_set_compression_queue_memory(struct repository *repo, unsigned long value)
-{
-	repo->settings.compression_queue_memory = value;
 }
 
 enum log_refs_config repo_settings_get_log_all_ref_updates(struct repository *repo)

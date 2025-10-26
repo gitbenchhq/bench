@@ -6,50 +6,20 @@
 #include "strbuf.h"
 #include "chunker.h"
 
-/* Forward declaration */
-struct parallel_compressor;
-
 /*
  * Streaming chunker for large files
  *
  * This module provides memory-efficient chunking of arbitrarily large files
- * using a streaming approach. Files are read in small pages (8KB) and
- * chunks are buffered one at a time (max 128MB per chunk).
+ * using a streaming approach. Files are read in small pages (64KB) and
+ * chunks are buffered one at a time (max 64MB per chunk).
  *
  * Key features:
- * - Bounded memory usage (max ~128MB for largest chunk + overhead)
- * - Parallel compression of chunks for performance
- * - Automatic fallback if chunking disabled or file too small
+ * - Bounded memory usage (max ~64MB for largest chunk + overhead)
+ * - Content-defined chunking using Gear hash for deduplication
+ * - Supports both file descriptor and in-memory buffer inputs
  */
 
-#define STREAMING_BUFFER_SIZE 65536  /* 64KB read buffer for optimal SHA-NI performance */
-
-/*
- * Async content hashing support.
- * A dedicated thread processes content hash updates in parallel with
- * the main thread's Gear hash and chunk boundary detection.
- */
-struct hash_job {
-	unsigned char *data;
-	size_t size;
-};
-
-struct async_hasher {
-	pthread_t thread;
-	pthread_mutex_t lock;
-	pthread_cond_t has_work;
-	pthread_cond_t has_space;
-
-	struct hash_job *queue;
-	size_t queue_size;
-	size_t queue_head;
-	size_t queue_tail;
-	size_t queue_count;
-
-	struct git_hash_ctx *hash_ctx;  /* Pointer to content_hash_ctx */
-	int shutdown;
-	int error;
-};
+#define STREAMING_BUFFER_SIZE 65536  /* 64KB read buffer */
 
 /*
  * Streaming chunker state
@@ -77,13 +47,9 @@ struct streaming_chunker {
 	size_t chunk_count;              /* Number of chunks created */
 	size_t chunk_capacity;           /* Allocated capacity for chunk_oids */
 
-	/* Parallel compression */
-	struct parallel_compressor *compressor; /* Parallel compression pool */
-
 	/* Content hash (for entire file as if it were one blob) */
 	struct git_hash_ctx content_hash_ctx; /* Hash of "blob <total_size>\0" + entire_file_data */
 	int content_hash_initialized;    /* Set to 1 after header is hashed */
-	struct async_hasher *hasher;     /* Async content hash thread (optional) */
 
 	/* Total file stats */
 	uint64_t total_size;             /* Total bytes processed */

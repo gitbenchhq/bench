@@ -988,7 +988,6 @@ LIB_OBJS += checkout.o
 LIB_OBJS += chunk-format.o
 LIB_OBJS += chunker.o
 LIB_OBJS += streaming-chunker.o
-LIB_OBJS += parallel-compress.o
 LIB_OBJS += color.o
 LIB_OBJS += column.o
 LIB_OBJS += combine-diff.o
