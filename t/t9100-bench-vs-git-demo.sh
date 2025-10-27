@@ -1,20 +1,11 @@
 #!/bin/sh
 #
-# Copyright (c) 2025 Bench Project
+# Copyright (c) 2025 GitBench
 #
 
-test_description='Git Breaks, Bench Works Demo
+test_description='Git vs Bench Demo
 
-This test demonstrates the core value proposition of Bench:
-Git struggles or fails with large files, while Bench handles them effortlessly.
-
-This is the customer-facing demo that shows:
-- Git taking 5+ minutes for gc OR running out of memory
-- Bench completing the same operations in <10 seconds with constant memory
-
-Test file size: 1.5GB (configurable)
-Expected Git behavior: Slow (>5min) or OOM
-Expected Bench behavior: Fast (<10s), <100MB RAM
+This test demonstrates the core value proposition of Bench in working with large files.
 '
 
 . ./test-lib.sh
@@ -39,7 +30,7 @@ test_expect_success 'setup: verify test file exists' '
 '
 
 # Bench test (Priority)
-test_expect_success BENCH 'bench: add large file quickly' '
+test_expect_success BENCH 'bench: add large file' '
 	bench init bench-repo &&
 	(
 		cd bench-repo &&
@@ -59,7 +50,7 @@ test_expect_success BENCH 'bench: add large file quickly' '
 	)
 '
 
-test_expect_success BENCH 'bench: modify and commit quickly' '
+test_expect_success BENCH 'bench: modify and commit' '
 	(
 		cd bench-repo &&
 
@@ -90,8 +81,8 @@ test_expect_success BENCH 'bench: gc completes quickly with low memory' '
 
 		echo "Bench gc: ${ELAPSED}s" &&
 
-		# Should complete in reasonable time (under 3 minutes for 1.5GB)
-		test "$ELAPSED" -lt 180
+		# Should complete in reasonable time (under 1 minute for 1.5GB)
+		test "$ELAPSED" -lt 60
 	)
 '
 
@@ -140,10 +131,6 @@ test_expect_success EXPENSIVE,LAZY_PREREQ 'git: comparison test (SLOW - for demo
 	git init git-repo &&
 	cd git-repo &&
 	cp "$TEST_FILE" data.bin &&
-
-	echo "WARNING: This test will be SLOW (5+ min) or may OOM" &&
-	echo "Press Ctrl+C to skip if needed" &&
-	sleep 3 &&
 
 	# This is expected to be slow
 	START=$(date +%s) &&

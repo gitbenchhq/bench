@@ -1384,12 +1384,17 @@ int index_path(struct index_state *istate, struct object_id *oid,
 					                 : file_content.len;
 
 					/* Chunk the filtered data using buffer interface */
+					/* Use bulk checkin to pack all chunks together for performance */
 					struct streaming_chunker sc;
 					struct object_id content_oid;
 
 					init_gear_table();
 
+					/* Begin transaction to batch all chunks into a single pack */
+					begin_odb_transaction();
+
 					if (streaming_chunker_init_from_buffer(&sc, data_to_chunk, data_len) < 0) {
+						end_odb_transaction();
 						rc = error(_("%s: failed to initialize chunker"), path);
 						goto cleanup_filter;
 					}
@@ -1398,6 +1403,7 @@ int index_path(struct index_state *istate, struct object_id *oid,
 						rc = error(_("%s: chunking failed: %s"), path,
 						          sc.error_message.buf);
 						streaming_chunker_cleanup(&sc);
+						end_odb_transaction();
 						goto cleanup_filter;
 					}
 
@@ -1405,10 +1411,12 @@ int index_path(struct index_state *istate, struct object_id *oid,
 						rc = error(_("%s: failed to create manifest: %s"), path,
 						          sc.error_message.buf);
 						streaming_chunker_cleanup(&sc);
+						end_odb_transaction();
 						goto cleanup_filter;
 					}
 
 					streaming_chunker_cleanup(&sc);
+					end_odb_transaction();
 
 				cleanup_filter:
 					strbuf_release(&filtered);
@@ -1424,12 +1432,17 @@ int index_path(struct index_state *istate, struct object_id *oid,
 					error(_("filters will NOT be applied (file too large)"));
 
 					/* Fall through to streaming chunker (no filters) */
+					/* Use bulk checkin to pack all chunks together for performance */
 					struct streaming_chunker sc;
 					struct object_id content_oid;
 
 					init_gear_table();
 
+					/* Begin transaction to batch all chunks into a single pack */
+					begin_odb_transaction();
+
 					if (streaming_chunker_init(&sc, fd, st->st_size) < 0) {
+						end_odb_transaction();
 						close(fd);
 						return error(_("%s: failed to initialize chunker"), path);
 					}
@@ -1438,6 +1451,7 @@ int index_path(struct index_state *istate, struct object_id *oid,
 						rc = error(_("%s: chunking failed: %s"), path,
 						          sc.error_message.buf);
 						streaming_chunker_cleanup(&sc);
+						end_odb_transaction();
 						close(fd);
 						return rc;
 					}
@@ -1446,24 +1460,31 @@ int index_path(struct index_state *istate, struct object_id *oid,
 						rc = error(_("%s: failed to create manifest: %s"), path,
 						          sc.error_message.buf);
 						streaming_chunker_cleanup(&sc);
+						end_odb_transaction();
 						close(fd);
 						return rc;
 					}
 
 					streaming_chunker_cleanup(&sc);
+					end_odb_transaction();
 					close(fd);
 				}
 			} else {
 				/*
 				 * Large file (> chunk.minSize) without filters:
 				 * Use streaming chunker with content-defined chunking.
+				 * Use bulk checkin to pack all chunks together for performance.
 				 */
 				struct streaming_chunker sc;
 				struct object_id content_oid;
 
 				init_gear_table();
 
+				/* Begin transaction to batch all chunks into a single pack */
+				begin_odb_transaction();
+
 				if (streaming_chunker_init(&sc, fd, st->st_size) < 0) {
+					end_odb_transaction();
 					close(fd);
 					return error(_("%s: failed to initialize chunker"), path);
 				}
@@ -1472,6 +1493,7 @@ int index_path(struct index_state *istate, struct object_id *oid,
 					rc = error(_("%s: chunking failed: %s"), path,
 					          sc.error_message.buf);
 					streaming_chunker_cleanup(&sc);
+					end_odb_transaction();
 					close(fd);
 					return rc;
 				}
@@ -1480,11 +1502,13 @@ int index_path(struct index_state *istate, struct object_id *oid,
 					rc = error(_("%s: failed to create manifest: %s"), path,
 					          sc.error_message.buf);
 					streaming_chunker_cleanup(&sc);
+					end_odb_transaction();
 					close(fd);
 					return rc;
 				}
 
 				streaming_chunker_cleanup(&sc);
+				end_odb_transaction();
 				close(fd);
 			}
 		} else {

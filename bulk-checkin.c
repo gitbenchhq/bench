@@ -367,6 +367,158 @@ int index_blob_bulk_checkin(struct object_id *oid,
 	return status;
 }
 
+/*
+ * Maximum size of a loose object header (e.g., "blob 18446744073709551615\0")
+ * Used for computing object IDs when bulk-checking buffers.
+ */
+#define MAX_LOOSE_OBJECT_HEADER_LEN 32
+
+/*
+ * Similar to index_blob_bulk_checkin, but works with a memory buffer
+ * instead of a file descriptor. This is useful for chunked files where
+ * we have chunks in memory buffers.
+ */
+static int stream_buffer_to_pack(struct bulk_checkin_packfile *state,
+				 struct git_hash_ctx *ctx,
+				 const void *buf, size_t size,
+				 unsigned flags)
+{
+	git_zstream s;
+	unsigned char obuf[16384];
+	unsigned hdrlen;
+	int status = Z_OK;
+	int write_object = (flags & INDEX_WRITE_OBJECT);
+	size_t offset = 0;
+
+	git_deflate_init(&s, pack_compression_level);
+
+	hdrlen = encode_in_pack_object_header(obuf, sizeof(obuf), OBJ_BLOB, size);
+	s.next_out = obuf + hdrlen;
+	s.avail_out = sizeof(obuf) - hdrlen;
+
+	while (status != Z_STREAM_END) {
+		if (offset < size && !s.avail_in) {
+			size_t chunk_size = size - offset;
+			if (chunk_size > sizeof(obuf))
+				chunk_size = sizeof(obuf);
+
+			git_hash_update(ctx, (const unsigned char *)buf + offset, chunk_size);
+			s.next_in = (unsigned char *)buf + offset;
+			s.avail_in = chunk_size;
+			offset += chunk_size;
+		}
+
+		status = git_deflate(&s, offset >= size ? Z_FINISH : 0);
+
+		if (!s.avail_out || status == Z_STREAM_END) {
+			if (write_object) {
+				size_t written = s.next_out - obuf;
+
+				/* would we bust the size limit? */
+				if (state->nr_written &&
+				    pack_size_limit_cfg &&
+				    pack_size_limit_cfg < state->offset + written) {
+					git_deflate_abort(&s);
+					return -1;
+				}
+
+				hashwrite(state->f, obuf, written);
+				state->offset += written;
+			}
+			s.next_out = obuf;
+			s.avail_out = sizeof(obuf);
+		}
+
+		switch (status) {
+		case Z_OK:
+		case Z_BUF_ERROR:
+		case Z_STREAM_END:
+			break;
+		default:
+			git_deflate_abort(&s);
+			return -1;
+		}
+	}
+	git_deflate_end(&s);
+	return 0;
+}
+
+static int deflate_buffer_to_pack(struct bulk_checkin_packfile *state,
+				  struct object_id *result_oid,
+				  const void *buf, size_t size,
+				  unsigned flags)
+{
+	struct git_hash_ctx ctx;
+	unsigned char header[MAX_LOOSE_OBJECT_HEADER_LEN];
+	unsigned header_len;
+	struct hashfile_checkpoint checkpoint;
+	struct pack_idx_entry *idx = NULL;
+
+	header_len = format_object_header((char *)header, sizeof(header),
+					  OBJ_BLOB, size);
+	the_hash_algo->init_fn(&ctx);
+	git_hash_update(&ctx, header, header_len);
+
+	/* Note: idx is non-NULL when we are writing */
+	if ((flags & INDEX_WRITE_OBJECT) != 0)
+		CALLOC_ARRAY(idx, 1);
+
+	while (1) {
+		prepare_to_stream(state, flags);
+		if (idx) {
+			hashfile_checkpoint(state->f, &checkpoint);
+			idx->offset = state->offset;
+			crc32_begin(state->f);
+		}
+
+		/* Reset hash context for retry - need to re-hash the header */
+		the_hash_algo->init_fn(&ctx);
+		git_hash_update(&ctx, header, header_len);
+
+		if (!stream_buffer_to_pack(state, &ctx, buf, size, flags))
+			break;
+
+		/*
+		 * Writing this object to the current pack will make
+		 * it too big; we need to truncate it, start a new
+		 * pack, and write into it.
+		 */
+		if (!idx)
+			BUG("should not happen");
+		hashfile_truncate(state->f, &checkpoint);
+		state->offset = checkpoint.offset;
+		flush_bulk_checkin_packfile(state);
+	}
+
+	git_hash_final_oid(result_oid, &ctx);
+	if (!idx)
+		return 0;
+
+	idx->crc32 = crc32_end(state->f);
+	if (already_written(state, result_oid)) {
+		hashfile_truncate(state->f, &checkpoint);
+		state->offset = checkpoint.offset;
+		free(idx);
+	} else {
+		oidcpy(&idx->oid, result_oid);
+		ALLOC_GROW(state->written,
+			   state->nr_written + 1,
+			   state->alloc_written);
+		state->written[state->nr_written++] = idx;
+	}
+	return 0;
+}
+
+int index_buffer_bulk_checkin(struct object_id *oid,
+			      const void *buf, size_t size,
+			      unsigned flags)
+{
+	int status = deflate_buffer_to_pack(&bulk_checkin_packfile, oid, buf, size, flags);
+	if (!odb_transaction_nesting)
+		flush_bulk_checkin_packfile(&bulk_checkin_packfile);
+	return status;
+}
+
 void begin_odb_transaction(void)
 {
 	odb_transaction_nesting += 1;

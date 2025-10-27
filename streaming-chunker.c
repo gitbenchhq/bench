@@ -2,6 +2,7 @@
 
 #include "git-compat-util.h"
 #include "streaming-chunker.h"
+#include "bulk-checkin.h"
 #include "object-file.h"
 #include "odb.h"
 #include "strbuf.h"
@@ -124,10 +125,11 @@ static int finalize_current_chunk(struct streaming_chunker *sc)
 	if (sc->chunk_buffer.len == 0)
 		return 0;  /* Empty chunk, nothing to do */
 
-	/* Write chunk as a blob object */
-	if (write_object_file_flags(sc->chunk_buffer.buf, sc->chunk_buffer.len,
-	                            OBJ_BLOB, &chunk_oid, NULL,
-	                            WRITE_OBJECT_FILE_PERSIST) < 0) {
+	/* Write chunk as a blob object using bulk checkin for performance.
+	 * This packs all chunks together instead of creating loose objects. */
+	if (index_buffer_bulk_checkin(&chunk_oid, sc->chunk_buffer.buf,
+	                               sc->chunk_buffer.len,
+	                               INDEX_WRITE_OBJECT) < 0) {
 		strbuf_addf(&sc->error_message, "failed to write chunk %zu to ODB",
 		            sc->chunk_count);
 		sc->error_occurred = 1;

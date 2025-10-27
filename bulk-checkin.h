@@ -29,6 +29,14 @@ int index_blob_bulk_checkin(struct object_id *oid,
 			    const char *path, unsigned flags);
 
 /*
+ * Similar to index_blob_bulk_checkin, but for memory buffers.
+ * This is used for chunked files where chunks are in memory.
+ */
+int index_buffer_bulk_checkin(struct object_id *oid,
+			      const void *buf, size_t size,
+			      unsigned flags);
+
+/*
  * Tell the object database to optimize for adding
  * multiple objects. end_odb_transaction must be called
  * to make new objects visible. Transactions can be nested,
