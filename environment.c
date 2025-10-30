@@ -43,7 +43,7 @@ char *apply_default_whitespace;
 char *apply_default_ignorewhitespace;
 char *git_attributes_file;
 int zlib_compression_level = Z_BEST_SPEED;
-int pack_compression_level = Z_DEFAULT_COMPRESSION;
+int pack_compression_level = Z_BEST_SPEED;
 int fsync_object_files = -1;
 int use_fsync = -1;
 enum fsync_method fsync_method = FSYNC_METHOD_DEFAULT;
