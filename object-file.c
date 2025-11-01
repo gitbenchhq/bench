@@ -32,6 +32,9 @@
 #include "setup.h"
 #include "streaming.h"
 #include "streaming-chunker.h"
+#ifdef BENCH_THREADS
+#include "streaming-chunker-threads.h"
+#endif
 
 /* The maximum size for an object header. */
 #define MAX_HEADER_LEN 32
@@ -1290,6 +1293,126 @@ int index_fd(struct index_state *istate, struct object_id *oid,
 	return ret;
 }
 
+/*
+ * BENCH_THREADS: Helper functions for parallel vs serial chunking
+ * Marked for potential removal if multi-threading is rolled back.
+ */
+
+/* Process file using serial streaming chunker */
+static int process_large_file_serial(const char *path, int fd, size_t file_size,
+                                     const char *buffer, size_t buffer_len,
+                                     struct object_id *oid)
+{
+	struct streaming_chunker sc;
+	struct object_id content_oid;
+	int rc = 0;
+
+	init_gear_table();
+	begin_odb_transaction();
+
+	/* Initialize chunker (file or buffer mode) */
+	if (buffer) {
+		if (streaming_chunker_init_from_buffer(&sc, buffer, buffer_len) < 0) {
+			end_odb_transaction();
+			return error(_("%s: failed to initialize chunker"), path);
+		}
+	} else {
+		if (streaming_chunker_init(&sc, fd, file_size) < 0) {
+			end_odb_transaction();
+			return error(_("%s: failed to initialize chunker"), path);
+		}
+	}
+
+	/* Process file/buffer */
+	if (streaming_chunker_process_file(&sc) < 0) {
+		rc = error(_("%s: chunking failed: %s"), path, sc.error_message.buf);
+		streaming_chunker_cleanup(&sc);
+		end_odb_transaction();
+		return rc;
+	}
+
+	/* Finalize manifest */
+	if (streaming_chunker_finalize(&sc, oid, &content_oid) < 0) {
+		rc = error(_("%s: failed to create manifest: %s"), path, sc.error_message.buf);
+		streaming_chunker_cleanup(&sc);
+		end_odb_transaction();
+		return rc;
+	}
+
+	streaming_chunker_cleanup(&sc);
+	end_odb_transaction();
+
+	return 0;
+}
+
+#ifdef BENCH_THREADS
+/* Process file using parallel streaming chunker */
+static int process_large_file_parallel(const char *path, int fd, size_t file_size,
+                                       const char *buffer, size_t buffer_len,
+                                       struct object_id *oid)
+{
+	struct streaming_chunker_threads sc;
+	struct object_id content_oid;
+	int rc = 0;
+
+	init_gear_table();
+	begin_odb_transaction();
+
+	/* Initialize parallel chunker (file or buffer mode) */
+	if (buffer) {
+		if (streaming_chunker_threads_init_from_buffer(&sc, buffer, buffer_len) < 0) {
+			end_odb_transaction();
+			return error(_("%s: failed to initialize parallel chunker"), path);
+		}
+	} else {
+		if (streaming_chunker_threads_init(&sc, fd, file_size) < 0) {
+			end_odb_transaction();
+			return error(_("%s: failed to initialize parallel chunker"), path);
+		}
+	}
+
+	/* Process file/buffer with parallel workers */
+	if (streaming_chunker_threads_process_file(&sc) < 0) {
+		rc = error(_("%s: parallel chunking failed: %s"), path, sc.error_message.buf);
+		streaming_chunker_threads_cleanup(&sc);
+		end_odb_transaction();
+		return rc;
+	}
+
+	/* Finalize manifest */
+	if (streaming_chunker_threads_finalize(&sc, oid, &content_oid) < 0) {
+		rc = error(_("%s: failed to create manifest: %s"), path, sc.error_message.buf);
+		streaming_chunker_threads_cleanup(&sc);
+		end_odb_transaction();
+		return rc;
+	}
+
+	streaming_chunker_threads_cleanup(&sc);
+	end_odb_transaction();
+
+	return 0;
+}
+#endif /* BENCH_THREADS */
+
+/* Wrapper: choose parallel or serial path based on settings */
+static int process_large_file(const char *path, int fd, size_t file_size,
+                              const char *buffer, size_t buffer_len,
+                              struct object_id *oid)
+{
+#ifdef BENCH_THREADS
+	/* Use parallel path if file is large enough and threads enabled */
+	int num_threads = repo_settings_get_bench_threads(the_repository);
+	fprintf(stderr, "[DEBUG] bench.threads = %d\n", num_threads);
+	if (num_threads > 1) {
+		fprintf(stderr, "[DEBUG] Using PARALLEL path with %d workers\n", num_threads);
+		return process_large_file_parallel(path, fd, file_size, buffer, buffer_len, oid);
+	}
+#endif
+	/* Fall back to serial path */
+	fprintf(stderr, "[DEBUG] Using SERIAL path\n");
+	return process_large_file_serial(path, fd, file_size, buffer, buffer_len, oid);
+}
+
 int index_path(struct index_state *istate, struct object_id *oid,
 	       const char *path, struct stat *st, unsigned flags)
 {
@@ -1384,39 +1507,10 @@ int index_path(struct index_state *istate, struct object_id *oid,
 					                 : file_content.len;
 
 					/* Chunk the filtered data using buffer interface */
-					/* Use bulk checkin to pack all chunks together for performance */
-					struct streaming_chunker sc;
-					struct object_id content_oid;
-
-					init_gear_table();
-
-					/* Begin transaction to batch all chunks into a single pack */
-					begin_odb_transaction();
-
-					if (streaming_chunker_init_from_buffer(&sc, data_to_chunk, data_len) < 0) {
-						end_odb_transaction();
-						rc = error(_("%s: failed to initialize chunker"), path);
+					/* BENCH_THREADS: Use parallel or serial path based on settings */
+					rc = process_large_file(path, -1, 0, data_to_chunk, data_len, oid);
+					if (rc < 0)
 						goto cleanup_filter;
-					}
-
-					if (streaming_chunker_process_file(&sc) < 0) {
-						rc = error(_("%s: chunking failed: %s"), path,
-						          sc.error_message.buf);
-						streaming_chunker_cleanup(&sc);
-						end_odb_transaction();
-						goto cleanup_filter;
-					}
-
-					if (streaming_chunker_finalize(&sc, oid, &content_oid) < 0) {
-						rc = error(_("%s: failed to create manifest: %s"), path,
-						          sc.error_message.buf);
-						streaming_chunker_cleanup(&sc);
-						end_odb_transaction();
-						goto cleanup_filter;
-					}
-
-					streaming_chunker_cleanup(&sc);
-					end_odb_transaction();
 
 				cleanup_filter:
 					strbuf_release(&filtered);
@@ -1432,84 +1526,22 @@ int index_path(struct index_state *istate, struct object_id *oid,
 					error(_("filters will NOT be applied (file too large)"));
 
 					/* Fall through to streaming chunker (no filters) */
-					/* Use bulk checkin to pack all chunks together for performance */
-					struct streaming_chunker sc;
-					struct object_id content_oid;
-
-					init_gear_table();
-
-					/* Begin transaction to batch all chunks into a single pack */
-					begin_odb_transaction();
-
-					if (streaming_chunker_init(&sc, fd, st->st_size) < 0) {
-						end_odb_transaction();
-						close(fd);
-						return error(_("%s: failed to initialize chunker"), path);
-					}
-
-					if (streaming_chunker_process_file(&sc) < 0) {
-						rc = error(_("%s: chunking failed: %s"), path,
-						          sc.error_message.buf);
-						streaming_chunker_cleanup(&sc);
-						end_odb_transaction();
-						close(fd);
-						return rc;
-					}
-
-					if (streaming_chunker_finalize(&sc, oid, &content_oid) < 0) {
-						rc = error(_("%s: failed to create manifest: %s"), path,
-						          sc.error_message.buf);
-						streaming_chunker_cleanup(&sc);
-						end_odb_transaction();
-						close(fd);
-						return rc;
-					}
-
-					streaming_chunker_cleanup(&sc);
-					end_odb_transaction();
+					/* BENCH_THREADS: Use parallel or serial path based on settings */
+					rc = process_large_file(path, fd, st->st_size, NULL, 0, oid);
 					close(fd);
+					if (rc < 0)
+						return rc;
 				}
 			} else {
 				/*
 				 * Large file (> chunk.minSize) without filters:
 				 * Use streaming chunker with content-defined chunking.
-				 * Use bulk checkin to pack all chunks together for performance.
+				 * BENCH_THREADS: Use parallel or serial path based on settings.
 				 */
-				struct streaming_chunker sc;
-				struct object_id content_oid;
-
-				init_gear_table();
-
-				/* Begin transaction to batch all chunks into a single pack */
-				begin_odb_transaction();
-
-				if (streaming_chunker_init(&sc, fd, st->st_size) < 0) {
-					end_odb_transaction();
-					close(fd);
-					return error(_("%s: failed to initialize chunker"), path);
-				}
-
-				if (streaming_chunker_process_file(&sc) < 0) {
-					rc = error(_("%s: chunking failed: %s"), path,
-					          sc.error_message.buf);
-					streaming_chunker_cleanup(&sc);
-					end_odb_transaction();
-					close(fd);
-					return rc;
-				}
-
-				if (streaming_chunker_finalize(&sc, oid, &content_oid) < 0) {
-					rc = error(_("%s: failed to create manifest: %s"), path,
-					          sc.error_message.buf);
-					streaming_chunker_cleanup(&sc);
-					end_odb_transaction();
-					close(fd);
-					return rc;
-				}
-
-				streaming_chunker_cleanup(&sc);
-				end_odb_transaction();
+				rc = process_large_file(path, fd, st->st_size, NULL, 0, oid);
 				close(fd);
+				if (rc < 0)
+					return rc;
 			}
 		} else {
 			/* Traditional git mode: create blob directly */
