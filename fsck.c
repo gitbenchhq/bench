@@ -519,8 +519,18 @@ static int fsck_walk_manifest(struct manifest *manifest, void *data, struct fsck
 	if (!manifest->buffer)
 		return error("manifest %s has no buffer", oid_to_hex(&manifest->object.oid));
 
-	/* Initialize descriptor to iterate through chunk OIDs */
-	init_manifest_desc(&desc, manifest->buffer, manifest->size,
+	/* Parse manifest header to get chunk data location */
+	struct manifest_header header;
+	struct strbuf err = STRBUF_INIT;
+	if (validate_manifest_header(the_repository, manifest->buffer, manifest->size, &header, &err) < 0) {
+		error("manifest %s has invalid header: %s", oid_to_hex(&manifest->object.oid), err.buf);
+		strbuf_release(&err);
+		return -1;
+	}
+	strbuf_release(&err);
+
+	/* Initialize descriptor to iterate through chunk OIDs (skip header, use chunk_data) */
+	init_manifest_desc(&desc, header.chunk_data, header.chunk_data_len,
 			   the_repository->hash_algo);
 
 	/* Walk each chunk blob */
