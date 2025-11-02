@@ -392,8 +392,8 @@ int repo_settings_get_bench_threads(struct repository *repo)
 			/* Auto-detect based on CPU/RAM */
 			threads = calculate_optimal_threads(repo);
 		} else if (threads == 0) {
-			/* Auto disabled, default to 4 */
-			threads = 4;
+			/* Auto disabled, default to 2 for debugging */
+			threads = 2;
 		}
 
 		repo->settings.bench_threads = threads;

@@ -1402,14 +1402,11 @@ static int process_large_file(const char *path, int fd, size_t file_size,
 #ifdef BENCH_THREADS
 	/* Use parallel path if file is large enough and threads enabled */
 	int num_threads = repo_settings_get_bench_threads(the_repository);
-	fprintf(stderr, "[DEBUG] bench.threads = %d\n", num_threads);
 	if (num_threads > 1) {
-		fprintf(stderr, "[DEBUG] Using PARALLEL path with %d workers\n", num_threads);
 		return process_large_file_parallel(path, fd, file_size, buffer, buffer_len, oid);
 	}
 #endif
 	/* Fall back to serial path */
-	fprintf(stderr, "[DEBUG] Using SERIAL path\n");
 	return process_large_file_serial(path, fd, file_size, buffer, buffer_len, oid);
 }
 

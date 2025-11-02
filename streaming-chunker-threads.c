@@ -27,6 +27,8 @@
 #include "hex.h"
 #include "repo-settings.h"
 #include "environment.h"
+#include "pack.h"
+#include "git-zlib.h"
 #include <pthread.h>
 #include <zlib.h>
 
@@ -73,8 +75,9 @@ static void *worker_thread(void *arg)
 	while (1) {
 		pthread_mutex_lock(&w->mutex);
 
-		/* Wait for work (status changes from IDLE to WORKING) */
-		while (w->status == WORKER_IDLE && !w->should_exit) {
+		/* Wait for work (status changes from IDLE to WORKING)
+		 * Also wait if status is DONE (waiting for consumer to mark us IDLE) */
+		while ((w->status == WORKER_IDLE || w->status == WORKER_DONE) && !w->should_exit) {
 			pthread_cond_wait(&w->cond, &w->mutex);
 		}
 
@@ -86,17 +89,48 @@ static void *worker_thread(void *arg)
 		/* We have work (status == WORKING) */
 		pthread_mutex_unlock(&w->mutex);
 
-		/* Compress the chunk using zlib */
-		uLongf compressed_size = compressBound(w->input_size);
-		int ret = compress2(w->output_buffer, &compressed_size,
-		                   w->input_buffer, w->input_size,
-		                   pack_compression_level);
+		/*
+		 * Create pack header + compressed data for bulk_checkin.
+		 * Format: [pack_header][compressed_data]
+		 * This allows bulk_checkin to accept pre-compressed chunks.
+		 * Use git_deflate() to match pack format expectations.
+		 */
+		unsigned char pack_header[MAX_PACK_OBJECT_HEADER];
+		int hdrlen = encode_in_pack_object_header(pack_header, sizeof(pack_header),
+		                                          OBJ_BLOB, w->input_size);
 
-		if (ret != Z_OK) {
+		/* Compress the chunk using git_deflate (match Git's approach) */
+		git_zstream stream;
+		unsigned char *out_ptr = w->output_buffer + hdrlen;
+		size_t out_size = 0;
+		int status;
+		unsigned long bound;
+
+		/* fprintf(stderr, "[W%d] Chunk %d: input_size=%zu, hdrlen=%d\n",
+		        w->worker_id, w->chunk_number, w->input_size, hdrlen); */
+
+		git_deflate_init(&stream, pack_compression_level);
+		bound = git_deflate_bound(&stream, w->input_size);
+		stream.next_in = w->input_buffer;
+		stream.avail_in = w->input_size;
+		stream.next_out = out_ptr;
+		stream.avail_out = bound;
+
+		while ((status = git_deflate(&stream, Z_FINISH)) == Z_OK)
+			; /* nothing */
+		git_deflate_end(&stream);
+
+		if (status != Z_STREAM_END) {
+			/* fprintf(stderr, "[W%d] Compression FAILED for chunk %d\n", w->worker_id, w->chunk_number); */
 			w->error = 1;
 			w->output_size = 0;
 		} else {
-			w->output_size = compressed_size;
+			out_size = stream.total_out;
+			/* Copy pack header to beginning of output buffer */
+			memcpy(w->output_buffer, pack_header, hdrlen);
+			w->output_size = hdrlen + out_size;
+			/* fprintf(stderr, "[W%d] Chunk %d compressed: %zu -> %zu (hdr=%d, data=%zu)\n",
+			        w->worker_id, w->chunk_number, w->input_size, w->output_size, hdrlen, out_size); */
 
 			/* Compute SHA256 of this chunk for manifest */
 			struct strbuf chunk_header = STRBUF_INIT;
@@ -112,10 +146,9 @@ static void *worker_thread(void *arg)
 			strbuf_release(&chunk_header);
 		}
 
-		/* Mark as done */
+		/* Mark as done (don't signal - consumer is polling) */
 		pthread_mutex_lock(&w->mutex);
 		w->status = WORKER_DONE;
-		pthread_cond_signal(&w->cond);  /* Signal consumer */
 		pthread_mutex_unlock(&w->mutex);
 	}
 
@@ -417,13 +450,17 @@ static int consume_next_chunk(struct streaming_chunker_threads *sc)
 		return -1;
 	}
 
-	/* Write compressed chunk to ODB via bulk checkin */
-	/* Note: We're writing compressed data, bulk_checkin will handle packing */
-	struct object_id written_oid;
-	if (index_buffer_bulk_checkin(&written_oid,
-	                               (const char *)w->output_buffer,
-	                               w->output_size,
-	                               INDEX_WRITE_OBJECT) < 0) {
+	/*
+	 * Write pre-compressed chunk to ODB via bulk checkin.
+	 * Worker has already created [pack_header][compressed_data] and computed OID.
+	 */
+	/* fprintf(stderr, "[CONSUMER] Writing chunk %d: oid=%s, size=%zu\n",
+	        w->chunk_number, oid_to_hex(&w->chunk_oid), w->output_size); */
+
+	if (index_precompressed_buffer_bulk_checkin(&w->chunk_oid,
+	                                             (const char *)w->output_buffer,
+	                                             w->output_size,
+	                                             INDEX_WRITE_OBJECT) < 0) {
 		strbuf_addf(&sc->error_message,
 		            "Failed to write chunk %d to ODB", w->chunk_number);
 		sc->error_occurred = 1;
@@ -438,6 +475,8 @@ static int consume_next_chunk(struct streaming_chunker_threads *sc)
 	}
 
 	oidcpy(&sc->chunk_oids[sc->chunk_count], &w->chunk_oid);
+	/* fprintf(stderr, "[CONSUMER] Stored chunk %d OID: %s\n",
+	        w->chunk_number, oid_to_hex(&w->chunk_oid)); */
 	sc->chunk_count++;
 
 	/* Mark worker as idle */
