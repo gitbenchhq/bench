@@ -2,27 +2,26 @@
 #define STREAMING_CHUNKER_THREADS_H
 
 /*
- * BENCH_THREADS: Parallel multi-threaded version of streaming-chunker
+ * Parallel streaming chunker with multi-threaded compression
  *
- * This is a DUPLICATE of streaming-chunker.c/h with parallel compression added.
- * Most logic is identical to streaming-chunker.c, but the processing loop
- * uses a producer-consumer model with worker threads.
- *
- * IMPORTANT: Keep this separate from streaming-chunker during validation phase.
- * If parallel compression proves successful, we may merge these files in the future.
- * For now, separation allows easy rollback and maintains stable serial code path.
+ * Public interface for parallel chunking operations. This extends the serial
+ * streaming-chunker interface with worker-pool based parallel compression.
  *
  * Architecture:
- * - Producer (main thread): Reads file in 64KB buffers, performs dual hashing
- *   (SHA256 content + Gear boundary), accumulates into chunk buffers
- * - Worker pool: Compresses chunks in parallel, computes per-chunk SHA256
- * - Consumer (main thread): Writes compressed chunks to pack file in sequential order
- * - Backpressure: Producer blocks when all workers busy
- * - Ordered output: Consumer waits for next sequential chunk
+ * - Producer thread: Reads file in 64KB buffers, performs dual hashing
+ *   (SHA256 content + Gear boundary detection), accumulates into chunk buffers
+ * - Worker pool: Compresses chunks in parallel using zlib, computes per-chunk
+ *   SHA256 hashes for manifest
+ * - Consumer thread: Writes compressed chunks to pack file in sequential order
+ * - Backpressure: Producer blocks when all workers are busy
+ * - Ordered output: Consumer waits for next sequential chunk before writing
  *
- * Memory constraint: Never exceed 1/2 total RAM (auto-detected, see repo-settings.c)
+ * Memory management: Worker pool size is constrained to never exceed 50% of
+ * total system RAM. Pool size is auto-detected based on available CPUs and
+ * memory (see repo-settings.c for configuration).
  *
- * This file marked with BENCH_THREADS for easy identification and potential removal.
+ * This file is kept separate from streaming-chunker.h for maintainability.
+ * Code is guarded with BENCH_THREADS for conditional compilation.
  */
 
 #ifdef BENCH_THREADS
@@ -125,11 +124,6 @@ struct streaming_chunker_threads {
 	/* Error handling */
 	int error_occurred;              /* Set to 1 on error */
 	struct strbuf error_message;     /* Detailed error message */
-
-	/* BENCH_THREADS_DEBUG: Memory usage tracking (temporary instrumentation) */
-#ifdef BENCH_THREADS_DEBUG
-	unsigned long peak_memory_mb;    /* Peak RSS in MB */
-#endif
 };
 
 /*

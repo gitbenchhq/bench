@@ -1355,14 +1355,8 @@ static int process_large_file_parallel(const char *path, int fd, size_t file_siz
 	struct object_id content_oid;
 	int rc = 0;
 
-	fprintf(stderr, "[PARALLEL] process_large_file_parallel START: path=%s, file_size=%zu\n", path, file_size);
-	fflush(stderr);
-
 	init_gear_table();
 	begin_odb_transaction();
-
-	fprintf(stderr, "[PARALLEL] Initialized, about to init chunker\n");
-	fflush(stderr);
 
 	/* Initialize parallel chunker (file or buffer mode) */
 	if (buffer) {
@@ -1408,15 +1402,9 @@ static int process_large_file(const char *path, int fd, size_t file_size,
 #ifdef BENCH_THREADS
 	/* Use parallel path if file is large enough and threads enabled */
 	int num_threads = repo_settings_get_bench_threads(the_repository);
-	fprintf(stderr, "[ENTRY] process_large_file: num_threads=%d, file_size=%zu\n", num_threads, file_size);
-	fflush(stderr);
 	if (num_threads > 1) {
-		fprintf(stderr, "[ENTRY] Taking parallel path\n");
-		fflush(stderr);
 		return process_large_file_parallel(path, fd, file_size, buffer, buffer_len, oid);
 	}
-	fprintf(stderr, "[ENTRY] Taking serial path\n");
-	fflush(stderr);
 #endif
 	/* Fall back to serial path */
 	return process_large_file_serial(path, fd, file_size, buffer, buffer_len, oid);

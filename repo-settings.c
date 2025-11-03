@@ -178,19 +178,19 @@ void repo_settings_set_big_file_threshold(struct repository *repo, unsigned long
  * Content-defined chunking configuration
  *
  * These settings control how large files are split into chunks:
- *   - chunk.minSize: Minimum chunk size (prevents excessive fragmentation)
- *   - chunk.targetSize: Target average chunk size (controls mask granularity)
- *   - chunk.maxSize: Maximum chunk size (prevents pathologically large chunks)
+ *   - chunk.minSize: Minimum chunk size (files < min stay as loose objects)
+ *   - chunk.targetSize: Target average chunk size (controls boundary frequency)
+ *   - chunk.maxSize: Maximum chunk size (enables deduplication flexibility)
  *
- * Defaults based on genomics file research:
- *   - min: 2 MB (prevents fragmentation, aligns with BorgBackup)
- *   - target: 16 MB (optimal for 50-200 GB genomics files)
- *   - max: 64 MB (reasonable upper bound, memory-safe)
+ * Defaults optimized through empirical testing:
+ *   - min: 2 MB (preserves loose objects for small files, Git-compatible)
+ *   - target: 8 MB (fine granularity for optimal deduplication)
+ *   - max: 256 MB (flexible upper bound)
  *
  * Users can configure via:
  *   bench config chunk.minSize 4m
- *   bench config chunk.targetSize 32m
- *   bench config chunk.maxSize 128m
+ *   bench config chunk.targetSize 16m
+ *   bench config chunk.maxSize 512m
  */
 
 unsigned long repo_settings_get_chunk_min_size(struct repository *repo)
@@ -205,7 +205,7 @@ unsigned long repo_settings_get_chunk_target_size(struct repository *repo)
 {
 	if (!repo->settings.chunk_target_size)
 		repo_cfg_ulong(repo, "chunk.targetsize",
-			       &repo->settings.chunk_target_size, 16 * 1024 * 1024);
+			       &repo->settings.chunk_target_size, 8 * 1024 * 1024);
 	return repo->settings.chunk_target_size;
 }
 
@@ -213,7 +213,7 @@ unsigned long repo_settings_get_chunk_max_size(struct repository *repo)
 {
 	if (!repo->settings.chunk_max_size)
 		repo_cfg_ulong(repo, "chunk.maxsize",
-			       &repo->settings.chunk_max_size, 64 * 1024 * 1024);
+			       &repo->settings.chunk_max_size, 256 * 1024 * 1024);
 	return repo->settings.chunk_max_size;
 }
 
