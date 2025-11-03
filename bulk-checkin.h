@@ -37,6 +37,17 @@ int index_buffer_bulk_checkin(struct object_id *oid,
 			      unsigned flags);
 
 /*
+ * BENCH_THREADS: Accept pre-compressed buffer with pack header and pre-calculated OID.
+ * This is used by parallel compression workers that create
+ * [pack_header][compressed_data] and compute the OID.
+ * Just writes the compressed data to pack and adds to index.
+ */
+int index_precompressed_buffer_bulk_checkin(const struct object_id *oid,
+					     const void *compressed_buf,
+					     size_t compressed_size,
+					     unsigned flags);
+
+/*
  * Tell the object database to optimize for adding
  * multiple objects. end_odb_transaction must be called
  * to make new objects visible. Transactions can be nested,

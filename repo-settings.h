@@ -72,6 +72,11 @@ struct repo_settings {
 	unsigned long chunk_target_size;
 	unsigned long chunk_max_size;
 
+	/* BENCH_THREADS: Parallel compression settings for bench add */
+	int bench_threads;              /* Number of worker threads (0 = auto-detect) */
+	int bench_threads_auto;         /* Auto-detect based on CPU/RAM (default: true) */
+	unsigned long bench_threads_memory_limit; /* Max RAM usage in MB (0 = auto: 50% of total) */
+
 	char *hooks_path;
 };
 #define REPO_SETTINGS_INIT { \
@@ -111,5 +116,13 @@ void repo_settings_set_chunk_max_size(struct repository *repo, unsigned long val
 int repo_settings_get_shared_repository(struct repository *repo);
 void repo_settings_set_shared_repository(struct repository *repo, int value);
 void repo_settings_reset_shared_repository(struct repository *repo);
+
+/* BENCH_THREADS: Read and set values for parallel compression. */
+int repo_settings_get_bench_threads(struct repository *repo);
+int repo_settings_get_bench_threads_auto(struct repository *repo);
+unsigned long repo_settings_get_bench_threads_memory_limit(struct repository *repo);
+void repo_settings_set_bench_threads(struct repository *repo, int value);
+void repo_settings_set_bench_threads_auto(struct repository *repo, int value);
+void repo_settings_set_bench_threads_memory_limit(struct repository *repo, unsigned long value);
 
 #endif /* REPO_SETTINGS_H */

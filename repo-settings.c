@@ -178,19 +178,19 @@ void repo_settings_set_big_file_threshold(struct repository *repo, unsigned long
  * Content-defined chunking configuration
  *
  * These settings control how large files are split into chunks:
- *   - chunk.minSize: Minimum chunk size (prevents excessive fragmentation)
- *   - chunk.targetSize: Target average chunk size (controls mask granularity)
- *   - chunk.maxSize: Maximum chunk size (prevents pathologically large chunks)
+ *   - chunk.minSize: Minimum chunk size (files < min stay as loose objects)
+ *   - chunk.targetSize: Target average chunk size (controls boundary frequency)
+ *   - chunk.maxSize: Maximum chunk size (enables deduplication flexibility)
  *
- * Defaults based on genomics file research:
- *   - min: 2 MB (prevents fragmentation, aligns with BorgBackup)
- *   - target: 16 MB (optimal for 50-200 GB genomics files)
- *   - max: 64 MB (reasonable upper bound, memory-safe)
+ * Defaults optimized through empirical testing:
+ *   - min: 2 MB (preserves loose objects for small files, Git-compatible)
+ *   - target: 8 MB (fine granularity for optimal deduplication)
+ *   - max: 256 MB (flexible upper bound)
  *
  * Users can configure via:
  *   bench config chunk.minSize 4m
- *   bench config chunk.targetSize 32m
- *   bench config chunk.maxSize 128m
+ *   bench config chunk.targetSize 16m
+ *   bench config chunk.maxSize 512m
  */
 
 unsigned long repo_settings_get_chunk_min_size(struct repository *repo)
@@ -205,7 +205,7 @@ unsigned long repo_settings_get_chunk_target_size(struct repository *repo)
 {
 	if (!repo->settings.chunk_target_size)
 		repo_cfg_ulong(repo, "chunk.targetsize",
-			       &repo->settings.chunk_target_size, 16 * 1024 * 1024);
+			       &repo->settings.chunk_target_size, 8 * 1024 * 1024);
 	return repo->settings.chunk_target_size;
 }
 
@@ -213,7 +213,7 @@ unsigned long repo_settings_get_chunk_max_size(struct repository *repo)
 {
 	if (!repo->settings.chunk_max_size)
 		repo_cfg_ulong(repo, "chunk.maxsize",
-			       &repo->settings.chunk_max_size, 64 * 1024 * 1024);
+			       &repo->settings.chunk_max_size, 256 * 1024 * 1024);
 	return repo->settings.chunk_max_size;
 }
 
@@ -288,3 +288,161 @@ void repo_settings_reset_shared_repository(struct repository *repo)
 {
 	repo->settings.shared_repository_initialized = 0;
 }
+
+/*
+ * BENCH_THREADS: Parallel compression settings for bench add.
+ * These functions auto-detect system resources (CPU cores, RAM) to determine
+ * optimal worker thread count while staying within memory constraints.
+ *
+ * Marked for potential removal if multi-threading is rolled back.
+ */
+#ifdef BENCH_THREADS
+
+#include <unistd.h>
+#ifdef __APPLE__
+#include <sys/types.h>
+#include <sys/sysctl.h>
+#endif
+
+/* Detect number of available CPU cores */
+static int detect_cpu_cores(void)
+{
+#ifdef _SC_NPROCESSORS_ONLN
+	long cores = sysconf(_SC_NPROCESSORS_ONLN);
+	if (cores > 0)
+		return (int)cores;
+#endif
+	/* Fallback if sysconf not available (e.g., Windows) */
+	return 4;
+}
+
+/* Detect total system RAM in MB */
+static unsigned long detect_total_ram_mb(void)
+{
+#ifdef __linux__
+	FILE *f = fopen("/proc/meminfo", "r");
+	if (f) {
+		char line[256];
+		while (fgets(line, sizeof(line), f)) {
+			unsigned long mem_kb;
+			if (sscanf(line, "MemTotal: %lu kB", &mem_kb) == 1) {
+				fclose(f);
+				return mem_kb / 1024; /* Convert to MB */
+			}
+		}
+		fclose(f);
+	}
+#elif defined(__APPLE__)
+	/* macOS: use sysctl for memory detection */
+	int mib[2] = { CTL_HW, HW_MEMSIZE };
+	uint64_t mem_bytes;
+	size_t len = sizeof(mem_bytes);
+	if (sysctl(mib, 2, &mem_bytes, &len, NULL, 0) == 0)
+		return (unsigned long)(mem_bytes / (1024 * 1024));
+#endif
+	/* Fallback: assume 8GB if detection fails */
+	return 8 * 1024;
+}
+
+/*
+ * Calculate optimal number of worker threads based on:
+ * 1. CPU cores (use half by default)
+ * 2. RAM constraint (total_RAM / 4) / max_chunk_size
+ * 3. User override via bench.threads config
+ *
+ * Critical constraint: Never exceed 1/2 total RAM
+ * (1/4 for input buffers + 1/4 for output buffers)
+ */
+static int calculate_optimal_threads(struct repository *repo)
+{
+	int cpu_threads, ram_threads, optimal;
+	unsigned long total_ram_mb, max_chunk_size_mb, memory_limit_mb;
+
+	/* Get CPU-based limit: half of available cores */
+	cpu_threads = detect_cpu_cores() / 2;
+	if (cpu_threads < 1)
+		cpu_threads = 1;
+
+	/* Get RAM-based limit */
+	total_ram_mb = detect_total_ram_mb();
+	memory_limit_mb = repo_settings_get_bench_threads_memory_limit(repo);
+	if (memory_limit_mb == 0)
+		memory_limit_mb = total_ram_mb / 2; /* Default: 50% of RAM */
+
+	max_chunk_size_mb = repo_settings_get_chunk_max_size(repo) / (1024 * 1024);
+
+	/* RAM constraint: each worker needs 2x max_chunk_size (input + output) */
+	ram_threads = memory_limit_mb / (2 * max_chunk_size_mb);
+	if (ram_threads < 1)
+		ram_threads = 1;
+
+	/* Use minimum of CPU and RAM constraints */
+	optimal = cpu_threads < ram_threads ? cpu_threads : ram_threads;
+
+	return optimal;
+}
+
+int repo_settings_get_bench_threads(struct repository *repo)
+{
+	if (!repo->settings.bench_threads) {
+		int threads = 0;
+		repo_cfg_int(repo, "bench.threads", &threads, 0);
+
+		if (threads == 0 && repo_settings_get_bench_threads_auto(repo)) {
+			/* Auto-detect based on CPU/RAM */
+			threads = calculate_optimal_threads(repo);
+		} else if (threads == 0) {
+			/* Auto disabled, default to 2 for debugging */
+			threads = 2;
+		}
+
+		repo->settings.bench_threads = threads;
+	}
+	return repo->settings.bench_threads;
+}
+
+int repo_settings_get_bench_threads_auto(struct repository *repo)
+{
+	if (!repo->settings.bench_threads_auto) {
+		int auto_detect = 1;
+		repo_cfg_bool(repo, "bench.threadsAuto", &auto_detect, 1);
+		repo->settings.bench_threads_auto = auto_detect;
+	}
+	return repo->settings.bench_threads_auto;
+}
+
+unsigned long repo_settings_get_bench_threads_memory_limit(struct repository *repo)
+{
+	if (!repo->settings.bench_threads_memory_limit) {
+		repo_cfg_ulong(repo, "bench.threadsMemoryLimit",
+			       &repo->settings.bench_threads_memory_limit, 0);
+	}
+	return repo->settings.bench_threads_memory_limit;
+}
+
+void repo_settings_set_bench_threads(struct repository *repo, int value)
+{
+	repo->settings.bench_threads = value;
+}
+
+void repo_settings_set_bench_threads_auto(struct repository *repo, int value)
+{
+	repo->settings.bench_threads_auto = value;
+}
+
+void repo_settings_set_bench_threads_memory_limit(struct repository *repo, unsigned long value)
+{
+	repo->settings.bench_threads_memory_limit = value;
+}
+
+#else /* !BENCH_THREADS */
+
+/* Stub implementations when BENCH_THREADS is disabled */
+int repo_settings_get_bench_threads(struct repository *repo) { return 1; }
+int repo_settings_get_bench_threads_auto(struct repository *repo) { return 0; }
+unsigned long repo_settings_get_bench_threads_memory_limit(struct repository *repo) { return 0; }
+void repo_settings_set_bench_threads(struct repository *repo, int value) { (void)repo; (void)value; }
+void repo_settings_set_bench_threads_auto(struct repository *repo, int value) { (void)repo; (void)value; }
+void repo_settings_set_bench_threads_memory_limit(struct repository *repo, unsigned long value) { (void)repo; (void)value; }
+
+#endif /* BENCH_THREADS */

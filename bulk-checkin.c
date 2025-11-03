@@ -509,11 +509,93 @@ static int deflate_buffer_to_pack(struct bulk_checkin_packfile *state,
 	return 0;
 }
 
+/*
+ * BENCH_THREADS: Write pre-compressed data with pack header to pack file.
+ * Unlike deflate_buffer_to_pack which compresses, this accepts data that's
+ * already compressed by worker threads: [pack_header][compressed_data].
+ * The OID has already been calculated by the worker thread.
+ */
+static int write_precompressed_to_pack(struct bulk_checkin_packfile *state,
+				       const struct object_id *oid,
+				       const void *compressed_buf,
+				       size_t compressed_size,
+				       unsigned flags)
+{
+	struct hashfile_checkpoint checkpoint;
+	struct pack_idx_entry *idx = NULL;
+
+	/* Note: idx is non-NULL when we are writing */
+	if ((flags & INDEX_WRITE_OBJECT) != 0)
+		CALLOC_ARRAY(idx, 1);
+
+	while (1) {
+		prepare_to_stream(state, flags);
+		if (idx) {
+			hashfile_checkpoint(state->f, &checkpoint);
+			idx->offset = state->offset;
+			crc32_begin(state->f);
+		}
+
+		/* Check if writing would bust size limit */
+		if (state->nr_written &&
+		    pack_size_limit_cfg &&
+		    pack_size_limit_cfg < state->offset + compressed_size) {
+			/*
+			 * Writing this object to the current pack will make
+			 * it too big; truncate and start new pack.
+			 */
+			if (!idx)
+				BUG("should not happen");
+			hashfile_truncate(state->f, &checkpoint);
+			state->offset = checkpoint.offset;
+			flush_bulk_checkin_packfile(state);
+			continue;
+		}
+
+		/* Write the pre-compressed data directly to pack */
+		if (flags & INDEX_WRITE_OBJECT) {
+			hashwrite(state->f, compressed_buf, compressed_size);
+			state->offset += compressed_size;
+		}
+		break;
+	}
+
+	if (!idx)
+		return 0;
+
+	idx->crc32 = crc32_end(state->f);
+	if (already_written(state, oid)) {
+		hashfile_truncate(state->f, &checkpoint);
+		state->offset = checkpoint.offset;
+		free(idx);
+	} else {
+		oidcpy(&idx->oid, oid);
+		ALLOC_GROW(state->written,
+			   state->nr_written + 1,
+			   state->alloc_written);
+		state->written[state->nr_written++] = idx;
+	}
+	return 0;
+}
+
 int index_buffer_bulk_checkin(struct object_id *oid,
 			      const void *buf, size_t size,
 			      unsigned flags)
 {
 	int status = deflate_buffer_to_pack(&bulk_checkin_packfile, oid, buf, size, flags);
+	if (!odb_transaction_nesting)
+		flush_bulk_checkin_packfile(&bulk_checkin_packfile);
+	return status;
+}
+
+int index_precompressed_buffer_bulk_checkin(const struct object_id *oid,
+					     const void *compressed_buf,
+					     size_t compressed_size,
+					     unsigned flags)
+{
+	int status = write_precompressed_to_pack(&bulk_checkin_packfile, oid,
+						 compressed_buf, compressed_size,
+						 flags);
 	if (!odb_transaction_nesting)
 		flush_bulk_checkin_packfile(&bulk_checkin_packfile);
 	return status;
