@@ -282,6 +282,7 @@ struct object *parse_object_buffer(struct repository *r, const struct object_id 
 		if (manifest) {
 			if (parse_manifest_buffer(r, manifest, buffer, size) < 0)
 				return NULL;
+			*eaten_p = 1;
 			obj = &manifest->object;
 		}
 	} else {
