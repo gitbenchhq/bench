@@ -55,17 +55,20 @@ struct worker_state {
 	int chunk_number;              /* Which chunk (0, 1, 2, ...) */
 
 	/* Input: uncompressed chunk data */
-	unsigned char *input_buffer;   /* Allocated to max_chunk_size */
-	size_t input_size;             /* Actual chunk size */
+	unsigned char *input_buffer;   /* Allocated to max_chunk_size + STREAMING_BUFFER_SIZE */
+	size_t input_size;             /* Actual chunk size (can exceed max_chunk_size by up to 64KB) */
 
 	/* Output: compressed chunk data + chunk OID */
-	unsigned char *output_buffer;  /* Allocated to compressBound(max_chunk_size) */
+	unsigned char *output_buffer;  /* Allocated to compressBound(max_chunk_size + STREAMING_BUFFER_SIZE) */
 	size_t output_size;            /* Size after compression */
 	struct object_id chunk_oid;    /* SHA256 of this chunk (for manifest) */
 
 	int error;                     /* Error flag */
 	int should_exit;               /* Signal to thread to exit */
 	int worker_id;                 /* For debugging/logging */
+
+	/* Back-pointer to parent for signaling consumer */
+	struct streaming_chunker_threads *parent;
 };
 
 /*
@@ -99,6 +102,14 @@ struct streaming_chunker_threads {
 	/* Worker pool */
 	struct worker_state *workers;    /* Array of worker threads */
 	int num_workers;                 /* Number of workers (from repo settings) */
+
+	/* Producer thread */
+	pthread_t producer_thread;       /* Thread for reading and chunking */
+	int producer_error;              /* Error flag for producer thread */
+
+	/* Consumer synchronization */
+	pthread_mutex_t consumer_mutex;  /* Protects consumer state */
+	pthread_cond_t consumer_cond;    /* Signals when work is available for consumer */
 
 	/* Chunk tracking */
 	int next_chunk_to_produce;       /* Next chunk number to create */

@@ -31,11 +31,9 @@
 #include "git-zlib.h"
 #include <pthread.h>
 #include <zlib.h>
-
-/* BENCH_THREADS_DEBUG: Memory usage tracking (temporary, mark for removal) */
-#ifdef BENCH_THREADS_DEBUG
 #include <stdio.h>
 
+/* Memory usage tracking - always available for timing reports */
 static double get_memory_usage_mb(void)
 {
 	FILE *f = fopen("/proc/self/status", "r");
@@ -54,6 +52,8 @@ static double get_memory_usage_mb(void)
 	return rss_kb / 1024.0;
 }
 
+/* BENCH_THREADS_DEBUG: Additional debug logging */
+#ifdef BENCH_THREADS_DEBUG
 static void log_memory_usage(const char *phase)
 {
 	double mem = get_memory_usage_mb();
@@ -87,6 +87,8 @@ static void *worker_thread(void *arg)
 		}
 
 		/* We have work (status == WORKING) */
+		/* DEBUG: fprintf(stderr, "[W%d] Woke up, got chunk %d to compress (size=%zu)\n",
+			w->worker_id, w->chunk_number, w->input_size); */
 		pthread_mutex_unlock(&w->mutex);
 
 		/*
@@ -106,31 +108,55 @@ static void *worker_thread(void *arg)
 		int status;
 		unsigned long bound;
 
-		/* fprintf(stderr, "[W%d] Chunk %d: input_size=%zu, hdrlen=%d\n",
+		/* DEBUG: fprintf(stderr, "[W%d] Chunk %d: input_size=%zu, hdrlen=%d\n",
 		        w->worker_id, w->chunk_number, w->input_size, hdrlen); */
 
+		/* DEBUG: fprintf(stderr, "[W%d] About to call git_deflate_init...\n", w->worker_id); */
 		git_deflate_init(&stream, pack_compression_level);
+		/* DEBUG: fprintf(stderr, "[W%d] git_deflate_init done\n", w->worker_id); */
+
 		bound = git_deflate_bound(&stream, w->input_size);
+		/* DEBUG: fprintf(stderr, "[W%d] git_deflate_bound returned %lu\n", w->worker_id, bound); */
+
 		stream.next_in = w->input_buffer;
 		stream.avail_in = w->input_size;
 		stream.next_out = out_ptr;
 		stream.avail_out = bound;
 
-		while ((status = git_deflate(&stream, Z_FINISH)) == Z_OK)
-			; /* nothing */
+		/* DEBUG: fprintf(stderr, "[W%d] About to enter deflate loop (avail_in=%u, avail_out=%u)...\n",
+		        w->worker_id, stream.avail_in, stream.avail_out); */
+
+		int loop_count = 0;
+		while ((status = git_deflate(&stream, Z_FINISH)) == Z_OK) {
+			loop_count++;
+			/* DEBUG: if (loop_count % 100 == 0) {
+				fprintf(stderr, "[W%d] Deflate loop iteration %d (status=%d, avail_in=%u, avail_out=%u)\n",
+				        w->worker_id, loop_count, status, stream.avail_in, stream.avail_out);
+			} */
+		}
+		/* DEBUG: fprintf(stderr, "[W%d] Deflate loop exited after %d iterations, status=%d\n",
+		        w->worker_id, loop_count, status); */
+
+		/* DEBUG: fprintf(stderr, "[W%d] About to call git_deflate_end...\n", w->worker_id); */
 		git_deflate_end(&stream);
+		/* DEBUG: fprintf(stderr, "[W%d] git_deflate_end done\n", w->worker_id); */
+
+		/* Compute results before acquiring mutex */
+		int error = 0;
+		size_t output_size_result = 0;
+		struct object_id chunk_oid_result;
 
 		if (status != Z_STREAM_END) {
 			/* fprintf(stderr, "[W%d] Compression FAILED for chunk %d\n", w->worker_id, w->chunk_number); */
-			w->error = 1;
-			w->output_size = 0;
+			error = 1;
+			output_size_result = 0;
 		} else {
 			out_size = stream.total_out;
 			/* Copy pack header to beginning of output buffer */
 			memcpy(w->output_buffer, pack_header, hdrlen);
-			w->output_size = hdrlen + out_size;
+			output_size_result = hdrlen + out_size;
 			/* fprintf(stderr, "[W%d] Chunk %d compressed: %zu -> %zu (hdr=%d, data=%zu)\n",
-			        w->worker_id, w->chunk_number, w->input_size, w->output_size, hdrlen, out_size); */
+			        w->worker_id, w->chunk_number, w->input_size, output_size_result, hdrlen, out_size); */
 
 			/* Compute SHA256 of this chunk for manifest */
 			struct strbuf chunk_header = STRBUF_INIT;
@@ -141,15 +167,27 @@ static void *worker_thread(void *arg)
 			the_hash_algo->init_fn(&ctx);
 			the_hash_algo->update_fn(&ctx, chunk_header.buf, chunk_header.len);
 			the_hash_algo->update_fn(&ctx, w->input_buffer, w->input_size);
-			the_hash_algo->final_oid_fn(&w->chunk_oid, &ctx);
+			the_hash_algo->final_oid_fn(&chunk_oid_result, &ctx);
 
 			strbuf_release(&chunk_header);
 		}
 
-		/* Mark as done (don't signal - consumer is polling) */
+		/* Mark as done - CRITICAL: Write all results inside mutex to ensure visibility */
 		pthread_mutex_lock(&w->mutex);
+		w->error = error;
+		w->output_size = output_size_result;
+		if (!error) {
+			oidcpy(&w->chunk_oid, &chunk_oid_result);
+		}
 		w->status = WORKER_DONE;
 		pthread_mutex_unlock(&w->mutex);
+		/* fprintf(stderr, "[W%d] Finished chunk %d, marked DONE, oid=%s\n",
+			w->worker_id, w->chunk_number, oid_to_hex(&w->chunk_oid)); */
+
+		/* Signal consumer that work is ready */
+		pthread_mutex_lock(&w->parent->consumer_mutex);
+		pthread_cond_signal(&w->parent->consumer_cond);
+		pthread_mutex_unlock(&w->parent->consumer_mutex);
 	}
 
 	return NULL;
@@ -162,6 +200,8 @@ static int init_workers(struct streaming_chunker_threads *sc)
 {
 	int i;
 	unsigned long max_chunk_size;
+	unsigned long input_buffer_size;
+	unsigned long output_buffer_size;
 
 	/* Get number of workers from repository settings */
 	sc->num_workers = repo_settings_get_bench_threads(the_repository);
@@ -170,6 +210,20 @@ static int init_workers(struct streaming_chunker_threads *sc)
 
 	sc->workers = xcalloc(sc->num_workers, sizeof(struct worker_state));
 	max_chunk_size = repo_settings_get_chunk_max_size(the_repository);
+
+	/*
+	 * Input buffer must accommodate max_chunk_size + one read buffer
+	 * because producer reads in STREAMING_BUFFER_SIZE chunks and may exceed
+	 * max_chunk_size before checking the limit.
+	 */
+	input_buffer_size = max_chunk_size + STREAMING_BUFFER_SIZE;
+
+	/*
+	 * Output buffer must be sized for the actual max input size,
+	 * not just max_chunk_size. For incompressible data, compressed size
+	 * can be larger than input (zlib overhead).
+	 */
+	output_buffer_size = compressBound(input_buffer_size);
 
 	log_memory_usage("Before worker allocation");
 
@@ -181,10 +235,11 @@ static int init_workers(struct streaming_chunker_threads *sc)
 		w->chunk_number = -1;
 		w->error = 0;
 		w->should_exit = 0;
+		w->parent = sc;
 
 		/* Allocate buffers */
-		w->input_buffer = xmalloc(max_chunk_size);
-		w->output_buffer = xmalloc(compressBound(max_chunk_size));
+		w->input_buffer = xmalloc(input_buffer_size);
+		w->output_buffer = xmalloc(output_buffer_size);
 
 		if (!w->input_buffer || !w->output_buffer) {
 			strbuf_addf(&sc->error_message,
@@ -205,6 +260,10 @@ static int init_workers(struct streaming_chunker_threads *sc)
 	}
 
 	log_memory_usage("After worker allocation");
+
+	/* Initialize consumer synchronization */
+	pthread_mutex_init(&sc->consumer_mutex, NULL);
+	pthread_cond_init(&sc->consumer_cond, NULL);
 
 	return 0;
 }
@@ -238,6 +297,10 @@ static void cleanup_workers(struct streaming_chunker_threads *sc)
 
 	free(sc->workers);
 	sc->workers = NULL;
+
+	/* Destroy consumer synchronization */
+	pthread_mutex_destroy(&sc->consumer_mutex);
+	pthread_cond_destroy(&sc->consumer_cond);
 
 	log_memory_usage("After worker cleanup");
 }
@@ -379,15 +442,21 @@ static int dispatch_chunk_to_worker(struct streaming_chunker_threads *sc)
 	int worker_idx;
 	struct worker_state *w;
 
+	/* DEBUG: fprintf(stderr, "[DISPATCH] chunk_buffer.len=%zu\n", sc->chunk_buffer.len); */
 	if (sc->chunk_buffer.len == 0)
 		return 0;  /* Empty chunk, nothing to do */
 
 	/* Wait for an idle worker (backpressure) */
+	/* fprintf(stderr, "[DISPATCH] Looking for idle worker (chunk %d, size=%zu)...\n",
+		sc->next_chunk_to_produce, sc->chunk_buffer.len); */
 	while ((worker_idx = find_idle_worker(sc)) < 0) {
+		/* fprintf(stderr, "[PRODUCER WAITING] All workers busy, producer sleeping...\n"); */
 		usleep(1000);  /* Sleep 1ms and retry */
 	}
 
 	w = &sc->workers[worker_idx];
+	/* fprintf(stderr, "[DISPATCH] Found worker %d, dispatching chunk %d (size=%zu)\n",
+		worker_idx, sc->next_chunk_to_produce, sc->chunk_buffer.len); */
 
 	/* Copy chunk data to worker's input buffer */
 	pthread_mutex_lock(&w->mutex);
@@ -400,7 +469,14 @@ static int dispatch_chunk_to_worker(struct streaming_chunker_threads *sc)
 	pthread_cond_signal(&w->cond);  /* Wake up worker */
 	pthread_mutex_unlock(&w->mutex);
 
+	/* fprintf(stderr, "[DISPATCH] Chunk %d dispatched to worker %d, signaled\n",
+		sc->next_chunk_to_produce, worker_idx); */
 	sc->next_chunk_to_produce++;
+
+	/* Signal consumer that a new chunk has been dispatched */
+	pthread_mutex_lock(&sc->consumer_mutex);
+	pthread_cond_signal(&sc->consumer_cond);
+	pthread_mutex_unlock(&sc->consumer_mutex);
 
 	/* Clear buffer for next chunk */
 	strbuf_reset(&sc->chunk_buffer);
@@ -425,20 +501,28 @@ static int consume_next_chunk(struct streaming_chunker_threads *sc)
 	int worker_idx;
 	struct worker_state *w;
 
+	/* DEBUG: fprintf(stderr, "[CONSUME] Looking for chunk %d\n", sc->next_chunk_to_consume); */
+
 	/* Find worker with next sequential chunk */
 	worker_idx = find_worker_with_chunk(sc, sc->next_chunk_to_consume);
-	if (worker_idx < 0)
+	if (worker_idx < 0) {
+		/* DEBUG: fprintf(stderr, "[CONSUME] Chunk %d not assigned yet\n", sc->next_chunk_to_consume); */
 		return 1;  /* Chunk not assigned to any worker yet */
+	}
 
 	w = &sc->workers[worker_idx];
+	/* DEBUG: fprintf(stderr, "[CONSUME] Found chunk %d in worker %d\n", sc->next_chunk_to_consume, worker_idx); */
 
 	pthread_mutex_lock(&w->mutex);
 
 	/* Check if worker is done */
 	if (w->status != WORKER_DONE) {
+		/* DEBUG: fprintf(stderr, "[CONSUME] Worker %d status=%d (not DONE), skipping\n", worker_idx, w->status); */
 		pthread_mutex_unlock(&w->mutex);
 		return 1;  /* Worker still processing */
 	}
+
+	/* DEBUG: fprintf(stderr, "[CONSUME] Worker %d is DONE, consuming chunk %d\n", worker_idx, w->chunk_number); */
 
 	/* Worker is done - check for errors */
 	if (w->error) {
@@ -454,7 +538,7 @@ static int consume_next_chunk(struct streaming_chunker_threads *sc)
 	 * Write pre-compressed chunk to ODB via bulk checkin.
 	 * Worker has already created [pack_header][compressed_data] and computed OID.
 	 */
-	/* fprintf(stderr, "[CONSUMER] Writing chunk %d: oid=%s, size=%zu\n",
+	/* DEBUG: fprintf(stderr, "[CONSUMER] Writing chunk %d: oid=%s, size=%zu\n",
 	        w->chunk_number, oid_to_hex(&w->chunk_oid), w->output_size); */
 
 	if (index_precompressed_buffer_bulk_checkin(&w->chunk_oid,
@@ -475,7 +559,7 @@ static int consume_next_chunk(struct streaming_chunker_threads *sc)
 	}
 
 	oidcpy(&sc->chunk_oids[sc->chunk_count], &w->chunk_oid);
-	/* fprintf(stderr, "[CONSUMER] Stored chunk %d OID: %s\n",
+	/* DEBUG: fprintf(stderr, "[CONSUMER] Stored chunk %d OID: %s\n",
 	        w->chunk_number, oid_to_hex(&w->chunk_oid)); */
 	sc->chunk_count++;
 
@@ -487,6 +571,7 @@ static int consume_next_chunk(struct streaming_chunker_threads *sc)
 	pthread_mutex_unlock(&w->mutex);
 
 	sc->next_chunk_to_consume++;
+	/* DEBUG: fprintf(stderr, "[CONSUME] Chunk consumed successfully, next_chunk_to_consume now=%d\n", sc->next_chunk_to_consume); */
 
 #ifdef BENCH_THREADS_DEBUG
 	double mem = get_memory_usage_mb();
@@ -497,158 +582,256 @@ static int consume_next_chunk(struct streaming_chunker_threads *sc)
 	return 0;
 }
 
-int streaming_chunker_threads_process_file(struct streaming_chunker_threads *sc)
+/*
+ * Producer thread: Reads file and dispatches chunks to workers
+ * Runs in separate thread to avoid blocking consumer
+ */
+static void *producer_thread_func(void *arg)
 {
+	struct streaming_chunker_threads *sc = arg;
 	size_t old_chunk_size;
+	int boundaries_found = 0;
 
-	log_memory_usage("Start processing");
+	/* fprintf(stderr, "[PRODUCER] Thread started\n"); */
 
-	/* Producer-Consumer loop */
-	while (1) {
-		/* PRODUCER: Read and chunk */
-		if (!sc->reading_done) {
-			ssize_t bytes_read = 0;
+	/* Producer loop: Read file and create chunks */
+	while (!sc->reading_done) {
+		ssize_t bytes_read = 0;
 
-			/* Read next page */
-			if (sc->fd >= 0) {
-				/* File mode */
-				bytes_read = xread(sc->fd, sc->read_buffer, STREAMING_BUFFER_SIZE);
-				if (bytes_read < 0) {
-					strbuf_addf(&sc->error_message, "read error: %s",
-					            strerror(errno));
-					sc->error_occurred = 1;
-					return -1;
-				}
-			} else {
-				/* Buffer mode */
-				size_t remaining = sc->buffer_len - sc->buffer_pos;
-				if (remaining > 0) {
-					bytes_read = remaining < STREAMING_BUFFER_SIZE
-					           ? remaining
-					           : STREAMING_BUFFER_SIZE;
-					memcpy(sc->read_buffer, sc->buffer + sc->buffer_pos, bytes_read);
-					sc->buffer_pos += bytes_read;
+		/* Read next page */
+		if (sc->fd >= 0) {
+			/* File mode */
+			bytes_read = xread(sc->fd, sc->read_buffer, STREAMING_BUFFER_SIZE);
+			if (bytes_read < 0) {
+				strbuf_addf(&sc->error_message, "read error: %s", strerror(errno));
+				sc->error_occurred = 1;
+				sc->producer_error = 1;
+				return NULL;
+			}
+		} else {
+			/* Buffer mode */
+			size_t remaining = sc->buffer_len - sc->buffer_pos;
+			if (remaining > 0) {
+				bytes_read = remaining < STREAMING_BUFFER_SIZE
+				           ? remaining
+				           : STREAMING_BUFFER_SIZE;
+				memcpy(sc->read_buffer, sc->buffer + sc->buffer_pos, bytes_read);
+				sc->buffer_pos += bytes_read;
+			}
+		}
+
+		if (bytes_read == 0) {
+			/* EOF - dispatch final chunk if any */
+			if (sc->chunk_buffer.len > 0) {
+				/* fprintf(stderr, "[EOF] Dispatching final chunk (size: %zu bytes, no boundary)\n",
+				        sc->chunk_buffer.len); */
+				if (dispatch_chunk_to_worker(sc) < 0) {
+					sc->producer_error = 1;
+					return NULL;
 				}
 			}
+			sc->reading_done = 1;
+			sc->total_chunks = sc->next_chunk_to_produce;
+			/* fprintf(stderr, "[EOF] Reading complete. Total chunks to produce: %d\n", sc->total_chunks); */
+			break;
+		}
 
-			if (bytes_read == 0) {
-				/* EOF - dispatch final chunk if any */
-				if (sc->chunk_buffer.len > 0) {
-					if (dispatch_chunk_to_worker(sc) < 0)
-						return -1;
-				}
-				sc->reading_done = 1;
-				sc->total_chunks = sc->next_chunk_to_produce;
+		/* Update content hash with this page */
+		if (sc->content_hash_initialized) {
+			the_hash_algo->update_fn(&sc->content_hash_ctx,
+			                         sc->read_buffer, bytes_read);
+		}
+
+		/* Add entire page to current chunk buffer */
+		old_chunk_size = sc->current_chunk_size;
+
+		strbuf_add(&sc->chunk_buffer, sc->read_buffer, bytes_read);
+		sc->current_chunk_size += bytes_read;
+		sc->total_size += bytes_read;
+
+		/* Skip boundary detection until we reach minimum chunk size */
+		if (sc->current_chunk_size >= sc->chunk_config.min_size) {
+			const unsigned char *scan_start;
+			size_t scan_length;
+			size_t bytes_before_scan;
+
+			if (old_chunk_size < sc->chunk_config.min_size) {
+				/* Just crossed minimum threshold with this page */
+				size_t bytes_to_skip = sc->chunk_config.min_size - old_chunk_size;
+				scan_start = sc->read_buffer + bytes_to_skip;
+				scan_length = bytes_read - bytes_to_skip;
+				bytes_before_scan = sc->chunk_config.min_size;
 			} else {
-				/* Update content hash with this page */
-				if (sc->content_hash_initialized) {
-					the_hash_algo->update_fn(&sc->content_hash_ctx,
-					                         sc->read_buffer, bytes_read);
-				}
+				/* Already past minimum - scan entire page */
+				scan_start = sc->read_buffer;
+				scan_length = bytes_read;
+				bytes_before_scan = old_chunk_size;
+			}
 
-				/* Add entire page to current chunk buffer */
-				old_chunk_size = sc->current_chunk_size;
+			/* Check for content-defined boundaries using Gear hash */
+			if (scan_length > 0) {
+				chunk_boundary_t boundary = find_chunk_boundary(
+					&sc->chunk_config,
+					scan_start,
+					scan_length,
+					&sc->fingerprint);
 
-				strbuf_add(&sc->chunk_buffer, sc->read_buffer, bytes_read);
-				sc->current_chunk_size += bytes_read;
-				sc->total_size += bytes_read;
+				if (boundary > 0) {
+					/* Boundary found - dispatch current chunk */
+					boundaries_found++;
+					/* fprintf(stderr, "[BOUNDARY] Found boundary #%d at position (chunk size: %zu bytes)\n",
+					        boundaries_found, bytes_before_scan + boundary); */
 
-				/*
-				 * Skip boundary detection until we reach minimum chunk size.
-				 * This is FastCDC's "skip sub-minimum cut-point" optimization.
-				 */
-				if (sc->current_chunk_size >= sc->chunk_config.min_size) {
-					/*
-					 * Determine which portion of the page to scan for boundaries.
-					 */
-					const unsigned char *scan_start;
-					size_t scan_length;
-					size_t bytes_before_scan;
+					size_t boundary_offset_in_page = (scan_start - sc->read_buffer) + boundary;
+					size_t chunk_final_size = bytes_before_scan + boundary;
+					size_t leftover_bytes = bytes_read - boundary_offset_in_page;
 
-					if (old_chunk_size < sc->chunk_config.min_size) {
-						/* Just crossed minimum threshold with this page.
-						 * Only scan the portion beyond min_size.
-						 */
-						size_t bytes_to_skip = sc->chunk_config.min_size - old_chunk_size;
-						scan_start = sc->read_buffer + bytes_to_skip;
-						scan_length = bytes_read - bytes_to_skip;
-						bytes_before_scan = sc->chunk_config.min_size;
-					} else {
-						/* Already past minimum before this page.
-						 * Scan the entire page.
-						 */
-						scan_start = sc->read_buffer;
-						scan_length = bytes_read;
-						bytes_before_scan = old_chunk_size;
+					/* Trim chunk_buffer to boundary point */
+					strbuf_setlen(&sc->chunk_buffer, chunk_final_size);
+					sc->current_chunk_size = chunk_final_size;
+
+					/* Dispatch chunk to worker */
+					if (dispatch_chunk_to_worker(sc) < 0) {
+						sc->producer_error = 1;
+						return NULL;
 					}
 
-					/* Check for content-defined boundaries using Gear hash */
-					if (scan_length > 0) {
-						chunk_boundary_t boundary = find_chunk_boundary(
-							&sc->chunk_config,
-							scan_start,
-							scan_length,
-							&sc->fingerprint);
-
-						if (boundary > 0) {
-							/* Boundary found - dispatch current chunk */
-							size_t boundary_offset_in_page = (scan_start - sc->read_buffer) + boundary;
-							size_t chunk_final_size = bytes_before_scan + boundary;
-							size_t leftover_bytes = bytes_read - boundary_offset_in_page;
-
-							/* Trim chunk_buffer to boundary point */
-							strbuf_setlen(&sc->chunk_buffer, chunk_final_size);
-							sc->current_chunk_size = chunk_final_size;
-
-							/* Dispatch chunk to worker */
-							if (dispatch_chunk_to_worker(sc) < 0)
-								return -1;
-
-							/* Start new chunk with leftover bytes */
-							if (leftover_bytes > 0) {
-								strbuf_add(&sc->chunk_buffer,
-								          sc->read_buffer + boundary_offset_in_page,
-								          leftover_bytes);
-								sc->current_chunk_size = leftover_bytes;
-							}
-
-							continue;
-						}
+					/* Start new chunk with leftover bytes */
+					if (leftover_bytes > 0) {
+						strbuf_add(&sc->chunk_buffer,
+						          sc->read_buffer + boundary_offset_in_page,
+						          leftover_bytes);
+						sc->current_chunk_size = leftover_bytes;
 					}
-				}
 
-				/* No boundary found - check if we've hit max size */
-				if (sc->current_chunk_size >= sc->chunk_config.max_size) {
-					/* Force chunk cut at max_size (safety limit) */
-					if (dispatch_chunk_to_worker(sc) < 0)
-						return -1;
+					continue;
 				}
 			}
 		}
 
-		/* CONSUMER: Write chunks in order */
+		/* No boundary found - check if we've hit max size */
+		if (sc->current_chunk_size >= sc->chunk_config.max_size) {
+			/* Force chunk cut at max_size (safety limit) */
+			/* fprintf(stderr, "[MAX_SIZE] Forcing chunk cut at max size (%zu bytes)\n",
+			        sc->current_chunk_size); */
+			if (dispatch_chunk_to_worker(sc) < 0) {
+				sc->producer_error = 1;
+				return NULL;
+			}
+		}
+	}
+
+	/* fprintf(stderr, "[PRODUCER] Thread finished (boundaries found: %d)\n", boundaries_found); */
+	return NULL;
+}
+
+int streaming_chunker_threads_process_file(struct streaming_chunker_threads *sc)
+{
+	log_memory_usage("Start processing");
+
+	/* Timing instrumentation */
+	struct timeval loop_start, loop_end;
+	gettimeofday(&loop_start, NULL);
+	long total_consume_us = 0;
+	int consume_count = 0;
+
+	/* Initialize producer state */
+	sc->producer_error = 0;
+
+	/* Start producer thread - runs independently, reading and chunking file */
+	/* fprintf(stderr, "[MAIN] Starting producer thread...\n"); */
+	if (pthread_create(&sc->producer_thread, NULL, producer_thread_func, sc) != 0) {
+		strbuf_addf(&sc->error_message, "failed to create producer thread: %s",
+		            strerror(errno));
+		sc->error_occurred = 1;
+		return -1;
+	}
+	/* fprintf(stderr, "[MAIN] Producer thread started, now running consumer loop...\n"); */
+
+	/* CONSUMER LOOP: Main thread only consumes chunks written by workers */
+	while (1) {
+		struct timeval t1, t2;
+
+		/* Try to consume next chunk in order */
+		gettimeofday(&t1, NULL);
 		int consume_result = consume_next_chunk(sc);
+		gettimeofday(&t2, NULL);
+		if (consume_result == 0) {  /* Successfully consumed a chunk */
+			total_consume_us += (t2.tv_sec - t1.tv_sec) * 1000000 + (t2.tv_usec - t1.tv_usec);
+			consume_count++;
+		}
 		if (consume_result < 0)
 			return -1;  /* Error */
 
 		/* Exit condition: reading done AND all chunks consumed */
 		if (sc->reading_done && sc->next_chunk_to_consume >= sc->total_chunks) {
+			/* fprintf(stderr, "[MAIN] All chunks consumed, exiting consumer loop\n"); */
 			break;
 		}
 
-		/* Small sleep to avoid busy-waiting */
-		if (!sc->reading_done || sc->next_chunk_to_consume < sc->total_chunks) {
-			usleep(100);  /* 0.1ms */
+		/* Wait for work to be available (if chunk not ready) */
+		if (consume_result == 1) {
+			/* Chunk not ready yet - wait for signal from worker or timeout */
+			struct timespec timeout;
+			clock_gettime(CLOCK_REALTIME, &timeout);
+			/* Use 10ms timeout - balances responsiveness with reduced polling */
+			timeout.tv_nsec += 10000000;  /* 10ms */
+			if (timeout.tv_nsec >= 1000000000) {
+				timeout.tv_sec++;
+				timeout.tv_nsec -= 1000000000;
+			}
+
+			pthread_mutex_lock(&sc->consumer_mutex);
+			int wait_result = pthread_cond_timedwait(&sc->consumer_cond, &sc->consumer_mutex, &timeout);
+			pthread_mutex_unlock(&sc->consumer_mutex);
+
+			/* DEBUG: Track if we're timing out frequently */
+			// if (wait_result == ETIMEDOUT) {
+			// 	fprintf(stderr, "[TIMEOUT] chunk %d timed out after 10ms\n", sc->next_chunk_to_consume);
+			// } else if (wait_result == 0) {
+			// 	fprintf(stderr, "[SIGNAL] chunk %d woke from signal\n", sc->next_chunk_to_consume);
+			// }
+			(void)wait_result;  /* Suppress unused variable warning */
 		}
 	}
 
-	log_memory_usage("End processing");
+	/* Wait for producer thread to finish */
+	/* fprintf(stderr, "[MAIN] Waiting for producer thread to join...\n"); */
+	pthread_join(sc->producer_thread, NULL);
+	/* fprintf(stderr, "[MAIN] Producer thread joined\n"); */
 
+	/* Check if producer encountered an error */
+	if (sc->producer_error) {
+		/* fprintf(stderr, "[MAIN] Producer thread reported error\n"); */
+		return -1;
+	}
+
+	gettimeofday(&loop_end, NULL);
+	long total_us = (loop_end.tv_sec - loop_start.tv_sec) * 1000000 + (loop_end.tv_usec - loop_start.tv_usec);
+
+	fprintf(stderr, "\n[TIMING] Producer/Consumer with separate threads:\n");
+	fprintf(stderr, "[TIMING]   Total time: %.3f seconds\n", total_us / 1000000.0);
+	fprintf(stderr, "[TIMING]   Chunks produced: %d, consumed: %zu\n", sc->total_chunks, sc->chunk_count);
+	if (sc->total_chunks != sc->chunk_count) {
+		fprintf(stderr, "[TIMING]   WARNING: Produced != Consumed! (%d != %zu)\n",
+		        sc->total_chunks, sc->chunk_count);
+	}
+	fprintf(stderr, "[TIMING]   Consumer writing (%d chunks): %.3f seconds (%.1f%%)\n",
+	        consume_count, total_consume_us / 1000000.0, (total_consume_us * 100.0) / total_us);
+	fprintf(stderr, "[TIMING]   Other/waiting: %.3f seconds (%.1f%%)\n",
+	        (total_us - total_consume_us) / 1000000.0,
+	        ((total_us - total_consume_us) * 100.0) / total_us);
+
+	/* Memory usage reporting */
+	double current_mem = get_memory_usage_mb();
 #ifdef BENCH_THREADS_DEBUG
-	fprintf(stderr, "[BENCH THREADS] Peak memory: %.2f MB\n", sc->peak_memory_mb);
-	fprintf(stderr, "[BENCH THREADS] Total chunks: %d\n", sc->total_chunks);
-	fprintf(stderr, "[BENCH THREADS] Workers used: %d\n", sc->num_workers);
+	double peak_mem = sc->peak_memory_mb;
+#else
+	double peak_mem = current_mem;  /* Without debug, only show current */
 #endif
+	fprintf(stderr, "[TIMING]   Memory usage: Current=%.2f MB, Peak=%.2f MB\n",
+	        current_mem, peak_mem);
+	fprintf(stderr, "[TIMING]   Workers used: %d\n", sc->num_workers);
 
 	return 0;
 }
