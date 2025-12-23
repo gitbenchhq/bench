@@ -10,6 +10,7 @@
 #include "object-file.h"
 #include "odb.h"
 #include "oidset.h"
+#include "oid-array.h"
 #include "tag.h"
 #include "blob.h"
 #include "tree.h"
@@ -71,11 +72,31 @@ static void mark_blob_uninteresting(struct blob *blob)
 
 static void mark_manifest_uninteresting(struct manifest *manifest)
 {
+	struct oid_array chunk_oids = OID_ARRAY_INIT;
+	unsigned long total_size;
+	size_t i;
+
 	if (!manifest)
 		return;
 	if (manifest->object.flags & UNINTERESTING)
 		return;
 	manifest->object.flags |= UNINTERESTING;
+
+	/*
+	 * Mark all chunks referenced by this manifest as uninteresting.
+	 * This is analogous to how mark_tree_contents_uninteresting marks
+	 * all blobs in a tree. If the remote already has this manifest,
+	 * it must also have all its chunks, so we don't need to send them.
+	 */
+	if (get_manifest_chunk_oids(the_repository, &manifest->object.oid,
+				    &total_size, &chunk_oids) == 0) {
+		for (i = 0; i < chunk_oids.nr; i++) {
+			struct blob *chunk = lookup_blob(the_repository,
+							 &chunk_oids.oid[i]);
+			mark_blob_uninteresting(chunk);
+		}
+	}
+	oid_array_clear(&chunk_oids);
 }
 
 static void mark_tree_contents_uninteresting(struct repository *r,
@@ -220,7 +241,7 @@ static void add_children_by_path(struct repository *r,
 			if (tree->object.flags & UNINTERESTING) {
 				struct manifest *child = lookup_manifest(r, &entry.oid);
 				if (child)
-					child->object.flags |= UNINTERESTING;
+					mark_manifest_uninteresting(child);
 			}
 			break;
 		default:

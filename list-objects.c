@@ -196,6 +196,15 @@ static void process_chunk(struct traversal_context *ctx,
 		return;
 
 	/*
+	 * Skip chunks that are already processed or that the remote already has.
+	 * This is analogous to the check in process_blob(). During pack negotiation,
+	 * chunks from old manifests are marked UNINTERESTING, so if the new manifest
+	 * shares a chunk with an old manifest, we don't need to send it again.
+	 */
+	if (b->object.flags & (UNINTERESTING | SEEN))
+		return;
+
+	/*
 	 * Chunks are implementation details of manifests.
 	 * They must always be included if their manifest is included.
 	 * We don't apply size filters to individual chunks - filtering

@@ -7,6 +7,9 @@
  * 3. Core Git operations (add, commit, checkout, status, diff, merge, etc.)
  * 4. Text filtering (CRLF conversion)
  * 5. Delta compression (enabled for small files, disabled for multi-chunk)
+ * 6. Repository maintenance (gc, fsck, prune)
+ * 7. Network operations (clone, fetch, push)
+ * 8. Incremental push with chunk deduplication
  *
  * These tests use 100MB files for speed while creating multiple chunks.
  */
@@ -619,6 +622,111 @@ static int test_network_operations(void)
 }
 
 /*
+ * Test 8: Incremental Push with Chunk Deduplication
+ * Tests: Push v1, modify file (shared chunks), push v2, clone, verify bit-perfect
+ * This specifically tests the chunk negotiation fix (2025-12-23)
+ */
+static int test_incremental_push_dedup(void)
+{
+	char v1_hash[128], v2_hash[128], cloned_hash[128];
+
+	TEST_START("Incremental Push with Chunk Deduplication");
+
+	/* Create working repository */
+	printf("Creating working repository with 50MB file...\n");
+	run_command("rm -rf incr-work incr-origin incr-clone");
+	run_command("bench init incr-work >/dev/null 2>&1");
+
+	if (chdir("incr-work") < 0)
+		TEST_FAIL("Failed to change to incr-work");
+
+	/* Create initial 50MB file and commit */
+	create_random_file("data.bin", 50);
+
+	if (run_command_capture("sha256sum data.bin | cut -d' ' -f1",
+	                        v1_hash, sizeof(v1_hash)) != 0)
+		TEST_FAIL("Failed to compute v1 SHA256");
+
+	printf("V1 SHA256: %s\n", v1_hash);
+
+	run_command("bench add data.bin >/dev/null 2>&1");
+	run_command("bench commit -m 'Version 1: 50MB file' >/dev/null 2>&1");
+	printf("✓ Version 1 committed\n");
+
+	chdir("..");
+
+	/* Create bare origin and push v1 */
+	printf("Creating bare origin and pushing v1...\n");
+	run_command("bench clone --bare incr-work incr-origin >/dev/null 2>&1");
+	printf("✓ V1 pushed to origin\n");
+
+	/* Modify file: append 10MB (creates new chunks, keeps some old ones) */
+	chdir("incr-work");
+	printf("Modifying file: appending 10MB...\n");
+	run_command("dd if=/dev/urandom bs=1M count=10 >> data.bin 2>/dev/null");
+
+	if (run_command_capture("sha256sum data.bin | cut -d' ' -f1",
+	                        v2_hash, sizeof(v2_hash)) != 0)
+		TEST_FAIL("Failed to compute v2 SHA256");
+
+	printf("V2 SHA256: %s\n", v2_hash);
+
+	/* Commit and push v2 */
+	run_command("bench add data.bin >/dev/null 2>&1");
+	run_command("bench commit -m 'Version 2: appended 10MB' >/dev/null 2>&1");
+
+	if (run_command("bench push ../incr-origin master >/dev/null 2>&1") != 0)
+		TEST_FAIL("bench push v2 failed");
+
+	printf("✓ Version 2 pushed (incremental - shared chunks not re-sent)\n");
+
+	chdir("..");
+
+	/* Clone to fresh repo and verify */
+	printf("Cloning to fresh repository...\n");
+	if (run_command("bench clone incr-origin incr-clone >/dev/null 2>&1") != 0)
+		TEST_FAIL("bench clone failed");
+
+	chdir("incr-clone");
+
+	if (run_command_capture("sha256sum data.bin | cut -d' ' -f1",
+	                        cloned_hash, sizeof(cloned_hash)) != 0)
+		TEST_FAIL("Failed to compute cloned SHA256");
+
+	printf("Cloned SHA256: %s\n", cloned_hash);
+
+	if (strcmp(v2_hash, cloned_hash) != 0)
+		TEST_FAIL("Cloned file doesn't match v2 - data corruption!");
+
+	printf("✓ Bit-perfect clone verified after incremental push\n");
+
+	/* Additional verification: checkout v1 and verify */
+	printf("Checking out v1 from history...\n");
+	if (run_command("bench checkout HEAD~1 -- data.bin >/dev/null 2>&1") != 0)
+		TEST_FAIL("bench checkout v1 failed");
+
+	char checkout_v1_hash[128];
+	if (run_command_capture("sha256sum data.bin | cut -d' ' -f1",
+	                        checkout_v1_hash, sizeof(checkout_v1_hash)) != 0)
+		TEST_FAIL("Failed to compute checkout v1 SHA256");
+
+	printf("Checkout V1 SHA256: %s\n", checkout_v1_hash);
+
+	if (strcmp(v1_hash, checkout_v1_hash) != 0)
+		TEST_FAIL("Checked out v1 doesn't match original v1 - history corrupted!");
+
+	printf("✓ V1 from history matches original\n");
+
+	chdir("..");
+
+	/* Cleanup */
+	run_command("rm -rf incr-work incr-origin incr-clone");
+
+	TEST_PASS();
+	return 0;
+}
+
+/*
  * Main test runner
  */
 int cmd__bench_core(int argc, const char **argv)
@@ -658,6 +766,7 @@ int cmd__bench_core(int argc, const char **argv)
 	ret |= test_delta_compression();
 	ret |= test_maintenance_operations();
 	ret |= test_network_operations();
+	ret |= test_incremental_push_dedup();
 
 	/* Return to original directory */
 	chdir(original_dir);
