@@ -356,7 +356,8 @@ static unsigned long detect_total_ram_mb(void)
 static int calculate_optimal_threads(struct repository *repo)
 {
 	int cpu_threads, ram_threads, optimal;
-	unsigned long total_ram_mb, max_chunk_size_mb, memory_limit_mb;
+	unsigned long total_ram_mb, memory_limit_mb;
+	unsigned long max_chunk_size, memory_limit_bytes;
 
 	/* Get CPU-based limit: half of available cores */
 	cpu_threads = detect_cpu_cores() / 2;
@@ -369,10 +370,16 @@ static int calculate_optimal_threads(struct repository *repo)
 	if (memory_limit_mb == 0)
 		memory_limit_mb = total_ram_mb / 2; /* Default: 50% of RAM */
 
-	max_chunk_size_mb = repo_settings_get_chunk_max_size(repo) / (1024 * 1024);
+	/*
+	 * Calculate in bytes to avoid integer truncation with small chunk sizes.
+	 * Previously, dividing by (1024 * 1024) first would truncate chunk sizes
+	 * smaller than 1MB to zero, causing division by zero.
+	 */
+	max_chunk_size = repo_settings_get_chunk_max_size(repo);
+	memory_limit_bytes = memory_limit_mb * 1024UL * 1024UL;
 
 	/* RAM constraint: each worker needs 2x max_chunk_size (input + output) */
-	ram_threads = memory_limit_mb / (2 * max_chunk_size_mb);
+	ram_threads = memory_limit_bytes / (2 * max_chunk_size);
 	if (ram_threads < 1)
 		ram_threads = 1;
 
