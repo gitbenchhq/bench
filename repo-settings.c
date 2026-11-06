@@ -1,6 +1,7 @@
 #include "git-compat-util.h"
 #include "config.h"
 #include "repo-settings.h"
+#include "gettext.h"
 #include "repository.h"
 #include "midx.h"
 #include "pack-objects.h"
@@ -201,11 +202,33 @@ unsigned long repo_settings_get_chunk_min_size(struct repository *repo)
 	return repo->settings.chunk_min_size;
 }
 
+/*
+ * The chunker cuts where the low N bits of the gear hash are zero, so the
+ * target is 2^N. Any other
+ * value would be silently rounded down to a power of two, so two
+ * "different" settings would chunk identically and neither would mean
+ * what it says: refuse it instead. 1 (= 2^0, a zero-bit mask) is refused
+ * too.
+ */
 unsigned long repo_settings_get_chunk_target_size(struct repository *repo)
 {
-	if (!repo->settings.chunk_target_size)
-		repo_cfg_ulong(repo, "chunk.targetsize",
-			       &repo->settings.chunk_target_size, 8 * 1024 * 1024);
+	if (!repo->settings.chunk_target_size) {
+		unsigned long v;
+
+		repo_cfg_ulong(repo, "chunk.targetsize", &v, 8 * 1024 * 1024);
+		if (v < 2 || (v & (v - 1))) {
+			unsigned long lower = 1;
+
+			while (lower <= v / 2)
+				lower <<= 1;
+			if (v < 2)
+				die(_("chunk.targetSize is %lu; it must be a power of two "
+				      "of at least 2 (for example 16m)"), v);
+			die(_("chunk.targetSize is %lu, which is not a power of two; "
+			      "use %lu or %lu"), v, lower, lower << 1);
+		}
+		repo->settings.chunk_target_size = v;
+	}
 	return repo->settings.chunk_target_size;
 }
 

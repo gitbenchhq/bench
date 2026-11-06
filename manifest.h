@@ -23,8 +23,7 @@ struct manifest *lookup_manifest(struct repository *r, const struct object_id *o
 /**
  * Attach a manifest's raw buffer to its object (parsed lazily by readers).
  *
- * Manifest format (version 1, the release format; context/architecture/
- * client.md section 6.3 in the gitbench platform repo is canonical):
+ * Manifest format (version 1):
  *
  *	1 LF                          version
  *	<total_size> LF               sum of the chunk sizes
@@ -165,8 +164,8 @@ int get_manifest_size(struct repository *r,
  * The format has no chunk-count cap. What limits a manifest is memory:
  * bench builds one in memory while writing it, using about this many bytes
  * per chunk at its peak (the OID and size arrays, the text, and its
- * compressed copy; ~200 typical, more while buffers grow). The gitbench
- * server advertises its own limit, bench-max-chunks, checked at push.
+ * compressed copy; ~200 typical, more while buffers grow). A remote may
+ * set its own, lower limit.
  */
 #define MANIFEST_MEMORY_PER_CHUNK 256
 
@@ -216,9 +215,8 @@ enum manifest_error {
 };
 
 /**
- * Parse a manifest strictly: every rule the server's pre-receive hook
- * applies except the server's advertised limits (bench-chunk-min,
- * bench-chunk-max, bench-max-chunks), which bench checks at push.
+ * Parse a manifest strictly: one valid encoding per manifest, so the same
+ * chunks always give the same bytes and the same manifest id.
  * The version is exactly MANIFEST_VERSION; numbers are canonical decimal;
  * OIDs are lowercase hex of `algo`; chunk_count is at least 1 and equals
  * the number of chunk lines; nothing follows the last line;

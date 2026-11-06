@@ -13,8 +13,8 @@ Checks the bytes bench writes for a manifest:
 	<chunk_count>
 	<chunk_oid> <size>   once per chunk
 
-and that the parser and bench fsck reject everything the server strict
-parse rejects.
+and that the parser and bench fsck reject every non-canonical or
+inconsistent manifest.
 '
 
 . ./test-lib.sh
@@ -293,6 +293,32 @@ do
 		)
 	'
 done
+
+test_expect_success 'chunk.targetSize must be a power of two' '
+	test_when_finished "rm -rf target" &&
+	bench init target &&
+	(
+		cd target &&
+		bench config chunk.minSize 16384 &&
+		bench config chunk.maxSize 131072 &&
+		test-tool genrandom t 300000 >t.bin &&
+
+		test_must_fail bench -c chunk.targetSize=20000 add t.bin 2>err &&
+		test_grep "chunk.targetSize is 20000, which is not a power of two; use 16384 or 32768" err &&
+		test_must_fail bench -c chunk.targetSize=48k add t.bin 2>err &&
+		test_grep "use 32768 or 65536" err &&
+		test_must_fail bench -c chunk.targetSize=1 add t.bin 2>err &&
+		test_grep "at least 2" err &&
+		test_must_fail bench -c chunk.targetSize=0 add t.bin 2>err &&
+		test_grep "at least 2" err &&
+		test_must_fail bench ls-files --error-unmatch t.bin &&
+
+		bench -c chunk.targetSize=32k add t.bin &&
+		test "$(bench cat-file -p $(manifest_of t.bin) | sed -n 4p)" -gt 1 &&
+		bench rm -q --cached t.bin &&
+		bench add t.bin
+	)
+'
 
 test_expect_success 'fsck: a chunk line whose size is not the chunk size' '
 	T=$(($(S) + 1)) &&

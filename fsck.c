@@ -1320,8 +1320,9 @@ static enum fsck_msg_id manifest_msg_id(enum manifest_error e)
 /*
  * Check a manifest's own bytes against the strict format rules. This runs
  * for every manifest fsck_buffer() sees, including index-pack on a push,
- * where the chunks are not local (on the gitbench server they never are),
- * so it must not look at chunk objects; fsck_manifest_chunks() does that.
+ * where the chunks may not be local (a receiving repository can keep its
+ * chunks elsewhere), so it must not look at chunk objects;
+ * fsck_manifest_chunks() does that.
  */
 static int fsck_manifest(const struct object_id *oid, const char *buf,
 			 unsigned long size, struct fsck_options *options)
