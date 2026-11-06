@@ -2,6 +2,7 @@
 #include "manifest.h"
 #include "object-file.h"
 #include "repository.h"
+#include "repo-settings.h"
 #include "alloc.h"
 #include "hex.h"
 #include "strbuf.h"
@@ -16,6 +17,7 @@
 #include "environment.h"
 #include "object-name.h"
 #include "object.h"
+#include "gettext.h"
 
 const char *manifest_type = "manifest";
 
@@ -63,73 +65,133 @@ struct manifest_stream {
 	int at_end;
 };
 
-/* manifest_header struct is now defined in manifest.h */
+__attribute__((format (printf, 3, 4)))
+static enum manifest_error fail(struct strbuf *err, enum manifest_error code,
+				const char *fmt, ...)
+{
+	if (err) {
+		va_list ap;
+		va_start(ap, fmt);
+		strbuf_vaddf(err, fmt, ap);
+		va_end(ap);
+	}
+	return code;
+}
 
-/*
- * Parse manifest header from buffer.
- * This centralizes all manifest version parsing logic.
- * Returns 0 on success, -1 on error.
- */
-static int parse_manifest_header(const void *buffer, unsigned long size,
-                                 struct manifest_header *header)
+/* Parse one canonical decimal number that must be followed by '\n'. */
+static int parse_number_line(const char **p, const char *end, uint64_t *value)
+{
+	const char *q;
+
+	if (manifest_parse_u64(*p, end, value, &q) < 0 || q >= end || *q != '\n')
+		return -1;
+	*p = q + 1;
+	return 0;
+}
+
+enum manifest_error parse_manifest(const struct git_hash_algo *algo,
+				   const void *buffer, unsigned long size,
+				   unsigned flags,
+				   struct manifest_header *header,
+				   struct strbuf *err)
 {
 	const char *p = buffer;
-	const char *end = (const char *)buffer + size;
-	
-	/* Parse version */
-	header->version = strtol(p, (char **)&p, 10);
-	if (p >= end || *p++ != '\n') {
-		error("manifest missing version number");
-		return -1;
-	}
-	
-	/* Version check: We currently only support version 1 */
-	if (header->version < 1) {
-		error("manifest has invalid version %d", header->version);
-		return -1;
-	}
-	if (header->version > 1) {
-		error("manifest version %d is newer than supported version 1", header->version);
-		return -1;
-	}
-	
-	/* Version 1 parsing - in future, use switch(version) for other versions */
-	if (header->version == 1) {
-		/* Parse total size */
-		if (manifest_parse_u64(p, end, &header->total_size, &p) < 0 ||
-		    p >= end || *p++ != '\n') {
-			error("manifest missing total size");
-			return -1;
-		}
-		
-		/* Parse content OID (complete file hash after filters) */
-		int algo_idx = get_oid_hex_any(p, &header->content_oid);
-		if (algo_idx == GIT_HASH_UNKNOWN) {
-			error("manifest missing or invalid content OID");
-			return -1;
-		}
-		p += hash_algos[algo_idx].hexsz;
-		if (p >= end || *p++ != '\n') {
-			error("manifest content OID not followed by newline");
-			return -1;
-		}
-		
-		/* Parse chunk count */
-		uint64_t chunk_count;
-		if (manifest_parse_u64(p, end, &chunk_count, &p) < 0 ||
-		    chunk_count > SIZE_MAX || p >= end || *p++ != '\n') {
-			error("manifest missing chunk count");
-			return -1;
-		}
-		header->chunk_count = chunk_count;
-	}
-	/* Future versions would have their parsing logic here */
-	
-	/* Set pointer to chunk OID data */
+	const char *end = p + size;
+	struct manifest_desc desc;
+	uint64_t version, chunk_count, sum = 0;
+	size_t lines = 0;
+	int ret;
+
+	if (parse_number_line(&p, end, &version) < 0)
+		return fail(err, MANIFEST_ERR_BAD_VERSION,
+			    "missing or non-canonical version line");
+	if (version != MANIFEST_VERSION)
+		return fail(err, MANIFEST_ERR_UNKNOWN_VERSION,
+			    "manifest version %"PRIu64" is not supported (this bench reads version %d)",
+			    version, MANIFEST_VERSION);
+	header->version = MANIFEST_VERSION;
+
+	if (parse_number_line(&p, end, &header->total_size) < 0)
+		return fail(err, MANIFEST_ERR_BAD_TOTAL_SIZE,
+			    "missing or non-canonical total_size");
+
+	if (manifest_parse_oid(p, end, algo, &header->content_oid, &p) < 0 ||
+	    p >= end || *p++ != '\n')
+		return fail(err, MANIFEST_ERR_BAD_CONTENT_OID,
+			    "content_oid is not %"PRIuMAX" lowercase hex digits and a newline",
+			    (uintmax_t)algo->hexsz);
+
+	if (parse_number_line(&p, end, &chunk_count) < 0)
+		return fail(err, MANIFEST_ERR_BAD_CHUNK_COUNT,
+			    "missing or non-canonical chunk_count");
+	if (!chunk_count)
+		return fail(err, MANIFEST_ERR_BAD_CHUNK_COUNT, "chunk_count is 0");
+	/*
+	 * No cap: walking the lines below is bounded by the bytes present,
+	 * so a huge chunk_count only produces a count mismatch.
+	 */
+	if (chunk_count > SIZE_MAX)
+		return fail(err, MANIFEST_ERR_CHUNK_COUNT_MISMATCH,
+			    "chunk_count %"PRIu64" is more than the chunk lines can hold",
+			    chunk_count);
+	header->chunk_count = chunk_count;
+
 	header->chunk_data = p;
 	header->chunk_data_len = end - p;
-	
-	return 0;
+
+	if (flags & MANIFEST_PARSE_HEADER_ONLY)
+		return MANIFEST_OK;
+
+	/*
+	 * Walk exactly chunk_count lines. Fewer lines, more lines and
+	 * trailing bytes are all a count mismatch; a line that is not
+	 * "<oid> <size>\n" is a bad chunk line.
+	 */
+	init_manifest_desc(&desc, header->chunk_data, header->chunk_data_len, algo);
+	while (lines < header->chunk_count) {
+		ret = manifest_entry(&desc);
+		if (ret < 0)
+			return fail(err, MANIFEST_ERR_BAD_CHUNK_LINE,
+				    "chunk line %"PRIuMAX" is not '<oid> <size>'",
+				    (uintmax_t)lines + 1);
+		if (!ret)
+			break;
+		if (desc.entry_size > UINT64_MAX - sum)
+			return fail(err, MANIFEST_ERR_SIZE_MISMATCH,
+				    "chunk sizes overflow");
+		sum += desc.entry_size;
+		lines++;
+	}
+	if (lines < header->chunk_count)
+		return fail(err, MANIFEST_ERR_CHUNK_COUNT_MISMATCH,
+			    "chunk_count is %"PRIuMAX" but there are %"PRIuMAX" chunk lines",
+			    (uintmax_t)header->chunk_count, (uintmax_t)lines);
+	if (desc.size)
+		return fail(err, MANIFEST_ERR_CHUNK_COUNT_MISMATCH,
+			    "data after chunk line %"PRIuMAX" (chunk_count is %"PRIuMAX")",
+			    (uintmax_t)lines, (uintmax_t)header->chunk_count);
+	if (sum != header->total_size)
+		return fail(err, MANIFEST_ERR_SIZE_MISMATCH,
+			    "chunk sizes sum to %"PRIu64" but total_size is %"PRIu64,
+			    sum, header->total_size);
+
+	return MANIFEST_OK;
+}
+
+/* Parse a manifest read from the object store, reporting any error. */
+static int parse_manifest_object(struct repository *r,
+				 const struct object_id *oid,
+				 const void *buffer, unsigned long size,
+				 unsigned flags,
+				 struct manifest_header *header)
+{
+	struct strbuf err = STRBUF_INIT;
+	int ret = 0;
+
+	if (parse_manifest(r->hash_algo, buffer, size, flags, header, &err) != MANIFEST_OK)
+		ret = error("manifest %s: %s", oid_to_hex(oid), err.buf);
+	strbuf_release(&err);
+	return ret;
 }
 
 struct manifest_stream *open_manifest_stream(struct repository *r,
@@ -153,7 +215,8 @@ struct manifest_stream *open_manifest_stream(struct repository *r,
 		return NULL;
 	
 	/* Parse the manifest header using shared function */
-	if (parse_manifest_header(manifest_buffer, manifest_size, &header) < 0) {
+	if (parse_manifest_object(r, manifest_oid, manifest_buffer, manifest_size,
+				  0, &header) < 0) {
 		free(manifest_buffer);
 		return NULL;
 	}
@@ -459,6 +522,23 @@ int stream_manifest_to_fd_filtered(struct repository *r, int fd,
 	return result;
 }
 
+int manifest_check_memory(struct repository *r, size_t chunk_count,
+			  struct strbuf *err)
+{
+	uint64_t limit = repo_settings_get_manifest_memory_limit(r);
+	uint64_t need = (uint64_t)chunk_count * MANIFEST_MEMORY_PER_CHUNK;
+
+	if (need <= limit)
+		return 0;
+	strbuf_addstr(err, _("this file's manifest needs more than "));
+	strbuf_humanise_bytes(err, need);
+	strbuf_addstr(err, _(" of memory (bench.manifestMemoryLimit is "));
+	strbuf_humanise_bytes(err, limit);
+	strbuf_addstr(err, _("); raise bench.manifestMemoryLimit, or use larger "
+			     "chunks (chunk.minSize, chunk.targetSize)"));
+	return -1;
+}
+
 /*
  * Build the release-format (version 1) manifest bytes. The format is fixed
  * here, not chosen by configuration: a per-clone setting would let two
@@ -487,7 +567,7 @@ static int build_manifest_content(struct strbuf *buf,
 		return error("BUG: manifest total size %"PRIu64" != sum of chunk sizes %"PRIu64,
 			     total_size, sum);
 
-	strbuf_addstr(buf, "1\n");
+	strbuf_addf(buf, "%d\n", MANIFEST_VERSION);
 	strbuf_addf(buf, "%"PRIu64"\n", total_size);
 	strbuf_addf(buf, "%s\n", oid_to_hex(content_oid));
 	strbuf_addf(buf, "%"PRIuMAX"\n", (uintmax_t)chunk_count);
@@ -561,7 +641,8 @@ int get_manifest_content_oid(struct repository *r,
 		return -1;
 	
 	/* Parse header to get content OID */
-	if (parse_manifest_header(manifest_buffer, manifest_size, &header) == 0) {
+	if (parse_manifest_object(r, manifest_oid, manifest_buffer, manifest_size,
+				  MANIFEST_PARSE_HEADER_ONLY, &header) == 0) {
 		oidcpy(content_oid, &header.content_oid);
 		ret = 0;
 	}
@@ -592,7 +673,8 @@ int get_manifest_chunk_oids(struct repository *r,
 		return -1;
 	
 	/* Parse the manifest header using shared function */
-	if (parse_manifest_header(manifest_buffer, manifest_size, &header) < 0) {
+	if (parse_manifest_object(r, manifest_oid, manifest_buffer, manifest_size,
+				  0, &header) < 0) {
 		free(manifest_buffer);
 		return -1;
 	}
@@ -601,17 +683,11 @@ int get_manifest_chunk_oids(struct repository *r,
 	if (chunk_oids) {
 		/* Initialize descriptor to iterate through chunk OIDs */
 		init_manifest_desc(&desc, header.chunk_data, header.chunk_data_len, r->hash_algo);
-		
-		int ret;
 
+		/* parse_manifest_object() already checked every line */
 		oid_array_clear(chunk_oids);
-		while ((ret = manifest_entry(&desc)) > 0)
+		while (manifest_entry(&desc) > 0)
 			oid_array_append(chunk_oids, &desc.entry_oid);
-		if (ret < 0) {
-			free(manifest_buffer);
-			return error("manifest %s has a malformed chunk line",
-				     oid_to_hex(manifest_oid));
-		}
 	}
 	
 	if (total_size)
@@ -670,7 +746,8 @@ int get_manifest_size(struct repository *r,
 		return -1;
 	
 	/* Parse the header to get the total size */
-	if (parse_manifest_header(manifest_buffer, manifest_size, &header) < 0) {
+	if (parse_manifest_object(r, manifest_oid, manifest_buffer, manifest_size,
+				  MANIFEST_PARSE_HEADER_ONLY, &header) < 0) {
 		free(manifest_buffer);
 		return -1;
 	}
@@ -680,203 +757,127 @@ int get_manifest_size(struct repository *r,
 	return 0;
 }
 
-/* Validation functions for fsck */
+/* Validation for fsck */
 
-int validate_manifest_header(struct repository *r, const void *buffer, unsigned long size,
-                           struct manifest_header *header,
-                           struct strbuf *err)
+/* "blob <uint64>\0" fits easily (object-file.c uses 32 for MAX_HEADER_LEN). */
+#define MAX_MANIFEST_HDR 32
+
+/*
+ * Hash one chunk by streaming it in small reads, never loading it whole:
+ * its blob id into *chunk_oid, and its bytes into content_ctx.
+ */
+static int stream_chunk_hash(struct repository *r, const struct object_id *oid,
+			     unsigned long size, struct git_hash_ctx *content_ctx,
+			     struct object_id *chunk_oid, char *buf, size_t bufsz)
 {
-	const char *p = buffer;
-	const char *end = (const char *)buffer + size;
-	
-	/* Parse version */
-	header->version = strtol(p, (char **)&p, 10);
-	if (p >= end || *p++ != '\n') {
-		strbuf_addstr(err, "manifest missing version number");
+	struct git_istream *st;
+	struct git_hash_ctx chunk_ctx;
+	enum object_type type;
+	unsigned long st_size;
+	uint64_t seen = 0;
+	char hdr[MAX_MANIFEST_HDR];
+	int hdrlen, ret = 0;
+
+	st = open_istream(r, oid, &type, &st_size, NULL);
+	if (!st)
 		return -1;
+
+	hdrlen = format_object_header(hdr, sizeof(hdr), OBJ_BLOB, size);
+	r->hash_algo->init_fn(&chunk_ctx);
+	git_hash_update(&chunk_ctx, hdr, hdrlen);
+	for (;;) {
+		ssize_t n = read_istream(st, buf, bufsz);
+		if (n < 0) {
+			ret = -1;
+			break;
+		}
+		if (!n)
+			break;
+		git_hash_update(&chunk_ctx, buf, n);
+		git_hash_update(content_ctx, buf, n);
+		seen += n;
 	}
-	
-	/* Version check: We currently only support version 1 */
-	if (header->version < 1) {
-		strbuf_addf(err, "manifest has invalid version %d", header->version);
-		return -1;
-	}
-	if (header->version > 1) {
-		strbuf_addf(err, "manifest version %d is newer than supported version 1", header->version);
-		return -1;
-	}
-	
-	/* Version 1 parsing */
-	if (header->version == 1) {
-		/* Parse total size - check for negative values first */
-		if (*p == '-') {
-			strbuf_addstr(err, "manifest has invalid negative size");
-			return -1;
-		}
-		if (manifest_parse_u64(p, end, &header->total_size, &p) < 0 ||
-		    p >= end || *p++ != '\n') {
-			strbuf_addstr(err, "manifest missing total size");
-			return -1;
-		}
-		
-		/* Parse content OID (complete file hash after filters) */
-		int algo_idx = get_oid_hex_any(p, &header->content_oid);
-		if (algo_idx == GIT_HASH_UNKNOWN) {
-			strbuf_addstr(err, "manifest missing or invalid content OID");
-			return -1;
-		}
-		p += hash_algos[algo_idx].hexsz;
-		if (p >= end || *p++ != '\n') {
-			strbuf_addstr(err, "manifest content OID not followed by newline");
-			return -1;
-		}
-		
-		/* Parse chunk count */
-		uint64_t chunk_count;
-		if (manifest_parse_u64(p, end, &chunk_count, &p) < 0 ||
-		    chunk_count > SIZE_MAX || p >= end || *p++ != '\n') {
-			strbuf_addstr(err, "manifest missing chunk count");
-			return -1;
-		}
-		header->chunk_count = chunk_count;
-		
-		/* Validate chunk count is reasonable */
-		if (header->chunk_count == 0) {
-			strbuf_addstr(err, "manifest has zero chunks");
-			return -1;
-		}
-	}
-	
-	/* Set pointer to chunk OID data */
-	header->chunk_data = p;
-	header->chunk_data_len = end - p;
-	
-	/*
-	 * Each chunk line is at least "<oid> 0\n" (hexsz + 3 bytes). Divide
-	 * rather than multiply so a huge chunk_count cannot overflow.
-	 */
-	size_t min_line = r->hash_algo->hexsz + 3;
-	if (header->chunk_data_len / min_line < header->chunk_count) {
-		strbuf_addf(err, "manifest chunk data too short (%"PRIuMAX" chunks, %"PRIuMAX" bytes)",
-			   (uintmax_t)header->chunk_count, (uintmax_t)header->chunk_data_len);
-		return -1;
-	}
-	
-	return 0;
+	close_istream(st);
+	git_hash_final_oid(chunk_oid, &chunk_ctx);
+	if (!ret && seen != size)
+		ret = -1;
+	return ret;
 }
 
-int validate_manifest_chunks(struct repository *r,
-                           const struct object_id *chunk_oids,
-                           size_t chunk_count,
-                           struct strbuf *err)
+enum manifest_error check_manifest_chunks(struct repository *r,
+					  const struct manifest_header *header,
+					  int full, struct strbuf *err)
 {
-	size_t i;
-	
-	for (i = 0; i < chunk_count; i++) {
-		enum object_type type;
-		
-		/* Check if chunk object exists */
-		type = oid_object_info(r, &chunk_oids[i], NULL);
-		if (type == OBJ_BAD) {
-			strbuf_addf(err, "chunk %zu object %s not found", 
-			           i, oid_to_hex(&chunk_oids[i]));
-			return -1;
-		}
-		
-		/* Verify chunk is a blob */
-		if (type != OBJ_BLOB) {
-			strbuf_addf(err, "chunk %zu object %s is %s, expected blob",
-			           i, oid_to_hex(&chunk_oids[i]), type_name(type));
-			return -1;
-		}
-	}
-	
-	return 0;
-}
+	struct manifest_desc desc;
+	struct git_hash_ctx content_ctx;
+	struct object_id computed;
+	enum manifest_error ret = MANIFEST_OK;
+	const size_t bufsz = 64 * 1024;
+	char *buf = NULL;
+	int all_local = 1;
+	size_t i = 0;
 
-int verify_manifest_integrity(struct repository *r,
-                            const struct manifest_header *header,
-                            const struct object_id *chunk_oids,
-                            struct strbuf *err)
-{
-	size_t i;
-	uint64_t total_chunk_size = 0;
-	struct git_hash_ctx ctx;
-	struct object_id computed_oid;
-	
-	/* Initialize computed_oid structure */
-	oidclr(&computed_oid, r->hash_algo);
-	
-	/* Initialize hash context for content OID computation */
-	r->hash_algo->init_fn(&ctx);
-	
-	/* Read each chunk and add complete blob object (with header) to hash */
-	for (i = 0; i < header->chunk_count; i++) {
+	if (full) {
+		/* content_oid is the git blob id of the whole file */
+		char hdr[MAX_MANIFEST_HDR];
+		int hdrlen = format_object_header(hdr, sizeof(hdr), OBJ_BLOB,
+						  header->total_size);
+
+		r->hash_algo->init_fn(&content_ctx);
+		git_hash_update(&content_ctx, hdr, hdrlen);
+		buf = xmalloc(bufsz);
+	}
+
+	init_manifest_desc(&desc, header->chunk_data, header->chunk_data_len,
+			   r->hash_algo);
+	while (!ret && manifest_entry(&desc) > 0) {
+		struct object_info oi = OBJECT_INFO_INIT;
+		struct object_id chunk_oid;
 		enum object_type type;
-		unsigned long chunk_size;
-		void *chunk_data;
-		struct strbuf blob_object = STRBUF_INIT;
-		
-		/* Read chunk data */
-		chunk_data = odb_read_object(r->objects, &chunk_oids[i], &type, &chunk_size);
-		if (!chunk_data) {
-			strbuf_addf(err, "failed to read chunk %zu object %s", 
-			           i, oid_to_hex(&chunk_oids[i]));
-			return -1;
+		unsigned long size;
+
+		i++;
+		/* Type and size only: no chunk data is read here. */
+		oi.typep = &type;
+		oi.sizep = &size;
+		if (odb_read_object_info_extended(r->objects, &desc.entry_oid, &oi,
+						  OBJECT_INFO_SKIP_FETCH_OBJECT) < 0) {
+			all_local = 0;
+			continue;
 		}
-		
-		if (type != OBJ_BLOB) {
-			strbuf_addf(err, "chunk %zu object %s is not a blob", 
-			           i, oid_to_hex(&chunk_oids[i]));
-			free(chunk_data);
-			return -1;
+		if (type != OBJ_BLOB)
+			ret = fail(err, MANIFEST_ERR_CHUNK_WRONG_TYPE,
+				   "chunk %"PRIuMAX" (%s) is a %s, not a blob",
+				   (uintmax_t)i, oid_to_hex(&desc.entry_oid),
+				   type_name(type));
+		else if ((uint64_t)size != desc.entry_size)
+			ret = fail(err, MANIFEST_ERR_CHUNK_SIZE_MISMATCH,
+				   "chunk %"PRIuMAX" (%s) is %lu bytes, manifest says %"PRIu64,
+				   (uintmax_t)i, oid_to_hex(&desc.entry_oid),
+				   size, desc.entry_size);
+		else if (full) {
+			if (stream_chunk_hash(r, &desc.entry_oid, size, &content_ctx,
+					      &chunk_oid, buf, bufsz) < 0)
+				ret = fail(err, MANIFEST_ERR_CHUNK_CORRUPT,
+					   "chunk %"PRIuMAX" (%s) could not be read",
+					   (uintmax_t)i, oid_to_hex(&desc.entry_oid));
+			else if (!oideq(&chunk_oid, &desc.entry_oid))
+				ret = fail(err, MANIFEST_ERR_CHUNK_CORRUPT,
+					   "chunk %"PRIuMAX" (%s) content hashes to %s",
+					   (uintmax_t)i, oid_to_hex(&desc.entry_oid),
+					   oid_to_hex(&chunk_oid));
 		}
-		
-		/* 
-		 * For content OID computation, we need to hash the complete blob objects.
-		 * Rather than manually reconstructing "blob N\0<content>", we can 
-		 * leverage Git's existing hash_object_file() function.
-		 */
-		struct object_id chunk_as_blob_oid;
-		hash_object_file(r->hash_algo, chunk_data, chunk_size, OBJ_BLOB, &chunk_as_blob_oid);
-		
-		/* Verify this matches the expected chunk OID */
-		if (!oideq(&chunk_oids[i], &chunk_as_blob_oid)) {
-			strbuf_addf(err, "chunk %zu OID mismatch: expected %s, computed %s", 
-			           i, oid_to_hex(&chunk_oids[i]), oid_to_hex(&chunk_as_blob_oid));
-			free(chunk_data);
-			return -1;
-		}
-		
-		/* Add the blob object's serialized form to content hash
-		 * Format: "blob <size>\0<content>" */
-		strbuf_addf(&blob_object, "blob %lu", chunk_size);
-		strbuf_addch(&blob_object, '\0');
-		strbuf_add(&blob_object, chunk_data, chunk_size);
-		
-		git_hash_update(&ctx, blob_object.buf, blob_object.len);
-		total_chunk_size += chunk_size;
-		
-		strbuf_release(&blob_object);
-		free(chunk_data);
 	}
-	
-	/* Finalize hash computation */
-	git_hash_final(computed_oid.hash, &ctx);
-	
-	/* Verify total size matches header */
-	if (total_chunk_size != header->total_size) {
-		strbuf_addf(err, "manifest total size mismatch: header says %"PRIu64", chunks sum to %"PRIu64,
-		           header->total_size, total_chunk_size);
-		return -1;
+
+	if (full) {
+		/* Always finalize, so the hash context is released. */
+		git_hash_final_oid(&computed, &content_ctx);
+		if (!ret && all_local && !oideq(&computed, &header->content_oid))
+			ret = fail(err, MANIFEST_ERR_CONTENT_MISMATCH,
+				   "content_oid is %s, but the file's blob id is %s",
+				   oid_to_hex(&header->content_oid),
+				   oid_to_hex(&computed));
+		free(buf);
 	}
-	
-	/* Verify content OID matches computed hash */
-	if (!oideq(&computed_oid, &header->content_oid)) {
-		strbuf_addf(err, "manifest content OID mismatch: header says %s, computed %s",
-		           oid_to_hex(&header->content_oid), oid_to_hex(&computed_oid));
-		return -1;
-	}
-	
-	return 0;
+	return ret;
 }

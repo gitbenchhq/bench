@@ -42,4 +42,13 @@ int manifest_entry(struct manifest_desc *desc);
  */
 int manifest_parse_u64(const char *p, const char *end, uint64_t *value, const char **next);
 
+/*
+ * Parse an OID from [p, end): exactly algo->hexsz lowercase hex digits.
+ * On success stores the OID, sets *next to the byte after it and returns
+ * 0; returns -1 otherwise.
+ */
+int manifest_parse_oid(const char *p, const char *end,
+		       const struct git_hash_algo *algo,
+		       struct object_id *oid, const char **next);
+
 #endif /* MANIFEST_WALK_H */

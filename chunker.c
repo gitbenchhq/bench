@@ -1,5 +1,6 @@
 #include "git-compat-util.h"
 #include "chunker.h"
+#include "strbuf.h"
 #include "hash.h"
 #include "repository.h"
 
@@ -177,4 +178,34 @@ chunk_boundary_t find_chunk_boundary(const struct chunk_config *cfg,
 	 */
 	*fingerprint = fp;
 	return -1;
+}
+
+void chunker_stamp_file(int fd, struct chunker_file_stamp *stamp)
+{
+	struct stat st;
+
+	memset(stamp, 0, sizeof(*stamp));
+	if (fd < 0 || fstat(fd, &st) < 0)
+		return;
+	stamp->size = st.st_size;
+	stamp->mtime = st.st_mtime;
+	stamp->mtime_nsec = ST_MTIME_NSEC(st);
+	stamp->valid = 1;
+}
+
+int chunker_file_changed(int fd, const struct chunker_file_stamp *stamp,
+			 struct strbuf *err)
+{
+	struct chunker_file_stamp now;
+
+	if (!stamp->valid)
+		return 0;
+	chunker_stamp_file(fd, &now);
+	if (!now.valid)
+		return 0;
+	if (now.size == stamp->size && now.mtime == stamp->mtime &&
+	    now.mtime_nsec == stamp->mtime_nsec)
+		return 0;
+	strbuf_addstr(err, "file changed while reading (it was written during bench add)");
+	return 1;
 }

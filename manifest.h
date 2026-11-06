@@ -158,10 +158,31 @@ int get_manifest_size(struct repository *r,
                      const struct object_id *manifest_oid,
                      uint64_t *size);
 
-/* Validation functions for fsck */
+/* The only manifest version this bench reads and writes. */
+#define MANIFEST_VERSION 1
+
+/*
+ * The format has no chunk-count cap. What limits a manifest is memory:
+ * bench builds one in memory while writing it, using about this many bytes
+ * per chunk at its peak (the OID and size arrays, the text, and its
+ * compressed copy; ~200 typical, more while buffers grow). The gitbench
+ * server advertises its own limit, bench-max-chunks, checked at push.
+ */
+#define MANIFEST_MEMORY_PER_CHUNK 256
+
+/*
+ * Check that a manifest of chunk_count chunks fits the memory bench may use
+ * for one (bench.manifestMemoryLimit, default a quarter of RAM). Returns 0
+ * if it fits, otherwise appends a message to err and returns -1. The
+ * chunkers call it for every chunk, so a file that is too large stops
+ * early instead of after reading all of it.
+ */
+int manifest_check_memory(struct repository *r, size_t chunk_count,
+			  struct strbuf *err);
+
 struct strbuf;
 
-/* Manifest header structure for validation */
+/* A manifest's header fields, filled in by parse_manifest(). */
 struct manifest_header {
 	int version;
 	uint64_t total_size;
@@ -171,35 +192,68 @@ struct manifest_header {
 	size_t chunk_data_len;   /* Length of the chunk lines in bytes */
 };
 
-/**
- * Validate manifest header structure and report errors to buffer.
- * This is similar to parse_manifest_header but reports validation errors
- * to err buffer instead of calling error() directly.
- * Returns 0 on success, -1 on error.
- **/
-int validate_manifest_header(struct repository *r, const void *buffer, unsigned long size,
-                           struct manifest_header *header,
-                           struct strbuf *err);
+/*
+ * What is wrong with a manifest. parse_manifest() returns the format
+ * errors and check_manifest_chunks() the chunk errors; fsck maps each one
+ * to its own message ID.
+ */
+enum manifest_error {
+	MANIFEST_OK = 0,
+	/* format: the manifest bytes themselves */
+	MANIFEST_ERR_BAD_VERSION,          /* version line missing or not canonical */
+	MANIFEST_ERR_UNKNOWN_VERSION,      /* canonical, but not MANIFEST_VERSION */
+	MANIFEST_ERR_BAD_TOTAL_SIZE,
+	MANIFEST_ERR_BAD_CONTENT_OID,
+	MANIFEST_ERR_BAD_CHUNK_COUNT,      /* not canonical, or 0 */
+	MANIFEST_ERR_BAD_CHUNK_LINE,
+	MANIFEST_ERR_CHUNK_COUNT_MISMATCH, /* lines != chunk_count, or trailing bytes */
+	MANIFEST_ERR_SIZE_MISMATCH,        /* sizes do not sum to total_size */
+	/* chunks: needs the chunk objects */
+	MANIFEST_ERR_CHUNK_WRONG_TYPE,
+	MANIFEST_ERR_CHUNK_SIZE_MISMATCH,  /* chunk object size != its line's size */
+	MANIFEST_ERR_CHUNK_CORRUPT,        /* chunk bytes do not hash to its OID */
+	MANIFEST_ERR_CONTENT_MISMATCH,     /* content_oid is not the file's blob id */
+};
 
 /**
- * Verify that all chunk OIDs in a manifest exist and are blobs.
- * Returns 0 if all chunks are valid, -1 if any are missing or wrong type.
- * Errors are reported to err buffer.
+ * Parse a manifest strictly: every rule the server's pre-receive hook
+ * applies except the server's advertised limits (bench-chunk-min,
+ * bench-chunk-max, bench-max-chunks), which bench checks at push.
+ * The version is exactly MANIFEST_VERSION; numbers are canonical decimal;
+ * OIDs are lowercase hex of `algo`; chunk_count is at least 1 and equals
+ * the number of chunk lines; nothing follows the last line;
+ * the sizes sum to total_size.
+ *
+ * With MANIFEST_PARSE_HEADER_ONLY in `flags`, only the four header lines
+ * are checked and the chunk lines are not walked: constant cost, for
+ * callers that need only total_size or content_oid. Anything that reads
+ * the chunk lines must parse without it, so a damaged manifest is
+ * caught before its chunks are used.
+ *
+ * On success fills `header` and returns MANIFEST_OK. Otherwise returns
+ * the error and, if `err` is not NULL, appends a message to it.
  **/
-int validate_manifest_chunks(struct repository *r,
-                           const struct object_id *chunk_oids,
-                           size_t chunk_count,
-                           struct strbuf *err);
+#define MANIFEST_PARSE_HEADER_ONLY (1u << 0)
+enum manifest_error parse_manifest(const struct git_hash_algo *algo,
+				   const void *buffer, unsigned long size,
+				   unsigned flags,
+				   struct manifest_header *header,
+				   struct strbuf *err);
 
 /**
- * Verify manifest data integrity by checking that chunk hashes match content.
- * This validates that the content_oid matches the hash of concatenated chunks.
- * Returns 0 if integrity check passes, -1 on error.
- * Errors are reported to err buffer.
+ * Check a parsed manifest against the chunk objects in the local object
+ * store: each one is a blob with the size its line says (no chunk data is
+ * read). With `full`, also read every chunk, check it hashes to its OID,
+ * and check content_oid is hash("blob <total_size>\0" + content).
+ *
+ * Chunks that are not stored locally are skipped, never fetched: fsck's
+ * connectivity check reports missing ones, and a partial clone may lack
+ * them on purpose. content_oid is only checked when every chunk is local.
+ *
+ * Returns MANIFEST_OK or the first error, with a message appended to err.
  **/
-int verify_manifest_integrity(struct repository *r,
-                            const struct manifest_header *header,
-                            const struct object_id *chunk_oids,
-                            struct strbuf *err);
+enum manifest_error check_manifest_chunks(struct repository *r,
+					  const struct manifest_header *header,
+					  int full, struct strbuf *err);
 
 #endif /* MANIFEST_H */

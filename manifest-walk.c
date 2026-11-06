@@ -33,6 +33,26 @@ int manifest_parse_u64(const char *p, const char *end, uint64_t *value, const ch
 	return 0;
 }
 
+int manifest_parse_oid(const char *p, const char *end,
+		       const struct git_hash_algo *algo,
+		       struct object_id *oid, const char **next)
+{
+	size_t hexsz = algo->hexsz;
+	size_t i;
+
+	if ((size_t)(end - p) < hexsz)
+		return -1;
+	for (i = 0; i < hexsz; i++) {
+		char c = p[i];
+		if (!(('0' <= c && c <= '9') || ('a' <= c && c <= 'f')))
+			return -1; /* not lowercase hex */
+	}
+	if (get_oid_hex_algop(p, oid, algo) < 0)
+		return -1;
+	*next = p + hexsz;
+	return 0;
+}
+
 /*
  * Parse the next "<oid> <size>\n" line. The OID must be exactly the
  * repository hash's hex length in lowercase; the line must end in '\n'.
@@ -42,24 +62,13 @@ int manifest_entry(struct manifest_desc *desc)
 	const char *buf = desc->buffer;
 	const char *end = buf + desc->size;
 	const char *p;
-	size_t hexsz = desc->algo->hexsz;
-	size_t i;
 
 	if (!desc->size)
 		return 0;
 
-	if (desc->size < hexsz + 1)
+	if (manifest_parse_oid(buf, end, desc->algo, &desc->entry_oid, &p) < 0)
 		return -1;
-	for (i = 0; i < hexsz; i++) {
-		char c = buf[i];
-		if (!(('0' <= c && c <= '9') || ('a' <= c && c <= 'f')))
-			return -1; /* not lowercase hex */
-	}
-	if (get_oid_hex_algop(buf, &desc->entry_oid, desc->algo) < 0)
-		return -1;
-
-	p = buf + hexsz;
-	if (*p++ != ' ')
+	if (p >= end || *p++ != ' ')
 		return -1;
 	if (manifest_parse_u64(p, end, &desc->entry_size, &p) < 0)
 		return -1;

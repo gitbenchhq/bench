@@ -289,32 +289,11 @@ void repo_settings_reset_shared_repository(struct repository *repo)
 	repo->settings.shared_repository_initialized = 0;
 }
 
-/*
- * BENCH_THREADS: Parallel compression settings for bench add.
- * These functions auto-detect system resources (CPU cores, RAM) to determine
- * optimal worker thread count while staying within memory constraints.
- *
- * Marked for potential removal if multi-threading is rolled back.
- */
-#ifdef BENCH_THREADS
-
 #include <unistd.h>
 #ifdef __APPLE__
 #include <sys/types.h>
 #include <sys/sysctl.h>
 #endif
-
-/* Detect number of available CPU cores */
-static int detect_cpu_cores(void)
-{
-#ifdef _SC_NPROCESSORS_ONLN
-	long cores = sysconf(_SC_NPROCESSORS_ONLN);
-	if (cores > 0)
-		return (int)cores;
-#endif
-	/* Fallback if sysconf not available (e.g., Windows) */
-	return 4;
-}
 
 /* Detect total system RAM in MB */
 static unsigned long detect_total_ram_mb(void)
@@ -342,6 +321,46 @@ static unsigned long detect_total_ram_mb(void)
 #endif
 	/* Fallback: assume 8GB if detection fails */
 	return 8 * 1024;
+}
+
+/*
+ * Memory bench may use for one manifest while writing it (see manifest.h,
+ * MANIFEST_MEMORY_PER_CHUNK). bench.manifestMemoryLimit takes a size with
+ * the usual k/m/g suffixes; 0 or unset means a quarter of this machine's
+ * RAM, leaving the half that parallel compression may take untouched.
+ */
+uint64_t repo_settings_get_manifest_memory_limit(struct repository *repo)
+{
+	if (!repo->settings.manifest_memory_limit) {
+		unsigned long limit = 0;
+
+		repo_cfg_ulong(repo, "bench.manifestMemoryLimit", &limit, 0);
+		repo->settings.manifest_memory_limit = limit ? (uint64_t)limit :
+			(uint64_t)detect_total_ram_mb() * 1024 * 1024 / 4;
+	}
+	return repo->settings.manifest_memory_limit;
+}
+
+/*
+ * BENCH_THREADS: Parallel compression settings for bench add.
+ * These functions auto-detect system resources (CPU cores, RAM) to determine
+ * optimal worker thread count while staying within memory constraints.
+ *
+ * Marked for potential removal if multi-threading is rolled back.
+ */
+#ifdef BENCH_THREADS
+
+
+/* Detect number of available CPU cores */
+static int detect_cpu_cores(void)
+{
+#ifdef _SC_NPROCESSORS_ONLN
+	long cores = sysconf(_SC_NPROCESSORS_ONLN);
+	if (cores > 0)
+		return (int)cores;
+#endif
+	/* Fallback if sysconf not available (e.g., Windows) */
+	return 4;
 }
 
 /*

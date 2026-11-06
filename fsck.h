@@ -72,16 +72,17 @@ enum fsck_msg_type {
 	FUNC(GITATTRIBUTES_LARGE, ERROR) \
 	FUNC(GITATTRIBUTES_LINE_LENGTH, ERROR) \
 	FUNC(GITATTRIBUTES_BLOB, ERROR) \
-	FUNC(MANIFEST_INVALID_VERSION, ERROR) \
-	FUNC(MANIFEST_MISSING_VERSION, ERROR) \
-	FUNC(MANIFEST_MISSING_SIZE, ERROR) \
-	FUNC(MANIFEST_MISSING_CONTENT_OID, ERROR) \
-	FUNC(MANIFEST_MISSING_CHUNK_COUNT, ERROR) \
-	FUNC(MANIFEST_INVALID_CHUNK_COUNT, ERROR) \
-	FUNC(MANIFEST_CHUNK_DATA_TOO_SHORT, ERROR) \
-	FUNC(MANIFEST_CHUNK_MISSING, ERROR) \
-	FUNC(MANIFEST_CHUNK_WRONG_TYPE, ERROR) \
+	FUNC(MANIFEST_BAD_VERSION, ERROR) \
+	FUNC(MANIFEST_UNKNOWN_VERSION, ERROR) \
+	FUNC(MANIFEST_BAD_TOTAL_SIZE, ERROR) \
+	FUNC(MANIFEST_BAD_CONTENT_OID, ERROR) \
+	FUNC(MANIFEST_BAD_CHUNK_COUNT, ERROR) \
+	FUNC(MANIFEST_BAD_CHUNK_LINE, ERROR) \
+	FUNC(MANIFEST_CHUNK_COUNT_MISMATCH, ERROR) \
 	FUNC(MANIFEST_SIZE_MISMATCH, ERROR) \
+	FUNC(MANIFEST_CHUNK_WRONG_TYPE, ERROR) \
+	FUNC(MANIFEST_CHUNK_SIZE_MISMATCH, ERROR) \
+	FUNC(MANIFEST_CHUNK_CORRUPT, ERROR) \
 	FUNC(MANIFEST_CONTENT_MISMATCH, ERROR) \
 	/* warnings */ \
 	FUNC(EMPTY_NAME, WARN) \
@@ -239,6 +240,17 @@ int fsck_object(struct object *obj, void *data, unsigned long size,
 int fsck_buffer(const struct object_id *oid, enum object_type,
 		const void *data, unsigned long size,
 		struct fsck_options *options);
+
+/*
+ * Check a manifest against its chunk objects in the local object store:
+ * each chunk's type and size, and with options->strict its content and
+ * the manifest's content_oid. Chunks not stored locally are skipped (the
+ * connectivity check reports missing ones). fsck_object() checks only the
+ * manifest's own bytes, so callers that have the chunks, like git fsck,
+ * call this as well.
+ */
+int fsck_manifest_chunks(const struct object_id *oid, const char *buf,
+			 unsigned long size, struct fsck_options *options);
 
 /*
  * fsck a tag, and pass info about it back to the caller. This is

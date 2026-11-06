@@ -172,7 +172,7 @@ static int verify_manifest_chunks(const struct object_id *manifest_oid,
 		return -1;
 	}
 
-	if (validate_manifest_header(the_repository, data, size, &header, &err) < 0) {
+	if (parse_manifest(the_repository->hash_algo, data, size, 0, &header, &err) != MANIFEST_OK) {
 		fprintf(stderr, "FAIL: Cannot parse manifest: %s\n", err.buf);
 		strbuf_release(&err);
 		free(data);
@@ -462,7 +462,7 @@ static int test_large_random_file(void)
 		return 1;
 	}
 
-	if (validate_manifest_header(the_repository, manifest_data, manifest_size, &header, &err) < 0) {
+	if (parse_manifest(the_repository->hash_algo, manifest_data, manifest_size, 0, &header, &err) != MANIFEST_OK) {
 		fprintf(stderr, "FAIL: Cannot parse manifest: %s\n", err.buf);
 		strbuf_release(&err);
 		free(manifest_data);
@@ -471,7 +471,7 @@ static int test_large_random_file(void)
 	strbuf_release(&err);
 
 	printf("  Chunks: %zu\n", header.chunk_count);
-	printf("  Total size: %lu bytes (%.1f MB)\n", header.total_size,
+	printf("  Total size: %"PRIu64" bytes (%.1f MB)\n", header.total_size,
 	       header.total_size / (1024.0 * 1024.0));
 
 	if (header.chunk_count <= 16) {
@@ -583,7 +583,7 @@ static int test_all_zeros_file(void)
 		return 1;
 	}
 
-	if (validate_manifest_header(the_repository, manifest_data, manifest_size, &header, &err) < 0) {
+	if (parse_manifest(the_repository->hash_algo, manifest_data, manifest_size, 0, &header, &err) != MANIFEST_OK) {
 		fprintf(stderr, "FAIL: Cannot parse manifest: %s\n", err.buf);
 		strbuf_release(&err);
 		free(manifest_data);
@@ -592,7 +592,7 @@ static int test_all_zeros_file(void)
 	strbuf_release(&err);
 
 	printf("  Chunks: %zu\n", header.chunk_count);
-	printf("  Total size: %lu bytes\n", header.total_size);
+	printf("  Total size: %"PRIu64" bytes\n", header.total_size);
 
 	size_t saved_chunk_count = header.chunk_count;
 	free(manifest_data);

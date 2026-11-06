@@ -77,6 +77,8 @@ struct repo_settings {
 	int bench_threads_auto;         /* Auto-detect based on CPU/RAM (default: true) */
 	unsigned long bench_threads_memory_limit; /* Max RAM usage in MB (0 = auto: 50% of total) */
 
+	uint64_t manifest_memory_limit; /* bytes; 0 = not read yet */
+
 	char *hooks_path;
 };
 #define REPO_SETTINGS_INIT { \
@@ -116,6 +118,9 @@ void repo_settings_set_chunk_max_size(struct repository *repo, unsigned long val
 int repo_settings_get_shared_repository(struct repository *repo);
 void repo_settings_set_shared_repository(struct repository *repo, int value);
 void repo_settings_reset_shared_repository(struct repository *repo);
+
+/* Read "bench.manifestMemoryLimit" in bytes (unset: a quarter of RAM). */
+uint64_t repo_settings_get_manifest_memory_limit(struct repository *repo);
 
 /* BENCH_THREADS: Read and set values for parallel compression. */
 int repo_settings_get_bench_threads(struct repository *repo);

@@ -54,6 +54,8 @@ struct streaming_chunker {
 
 	/* Total file stats */
 	uint64_t total_size;             /* Total bytes processed */
+	uint64_t expected_size;          /* Size hashed into the content_oid header */
+	struct chunker_file_stamp stamp; /* File size + mtime before reading (file mode) */
 
 	/* Error handling */
 	int error_occurred;              /* Set to 1 on error */

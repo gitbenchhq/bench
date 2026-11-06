@@ -319,6 +319,7 @@ static int streaming_chunker_threads_init_common(struct streaming_chunker_thread
 	 * This represents what Git would have computed if it hashed the data as one blob.
 	 */
 	struct strbuf header = STRBUF_INIT;
+	sc->expected_size = data_size;
 	strbuf_addf(&header, "blob %zu", data_size);
 	strbuf_addch(&header, '\0');
 
@@ -355,6 +356,7 @@ int streaming_chunker_threads_init(struct streaming_chunker_threads *sc, int fd,
 	sc->buffer = NULL;
 	sc->buffer_len = 0;
 	sc->buffer_pos = 0;
+	chunker_stamp_file(fd, &sc->stamp);
 
 	return streaming_chunker_threads_init_common(sc, (size_t)file_size);
 }
@@ -377,6 +379,26 @@ int streaming_chunker_threads_init_from_buffer(struct streaming_chunker_threads 
  * Dispatch current chunk_buffer to an idle worker
  * Returns 0 on success, -1 on error
  */
+/* Producer <-> consumer flags, both guarded by consumer_mutex. */
+static int producer_should_stop(struct streaming_chunker_threads *sc)
+{
+	int stop;
+
+	pthread_mutex_lock(&sc->consumer_mutex);
+	stop = sc->stop_producer;
+	pthread_mutex_unlock(&sc->consumer_mutex);
+	return stop;
+}
+
+static void *producer_exit(struct streaming_chunker_threads *sc)
+{
+	pthread_mutex_lock(&sc->consumer_mutex);
+	sc->producer_exited = 1;
+	pthread_cond_signal(&sc->consumer_cond);
+	pthread_mutex_unlock(&sc->consumer_mutex);
+	return NULL;
+}
+
 static int dispatch_chunk_to_worker(struct streaming_chunker_threads *sc)
 {
 	int worker_idx;
@@ -387,6 +409,8 @@ static int dispatch_chunk_to_worker(struct streaming_chunker_threads *sc)
 
 	/* Wait for an idle worker (backpressure) */
 	while ((worker_idx = find_idle_worker(sc)) < 0) {
+		if (producer_should_stop(sc))
+			return -1;
 		usleep(1000);  /* Sleep 1ms and retry */
 	}
 
@@ -453,6 +477,14 @@ static int consume_next_chunk(struct streaming_chunker_threads *sc)
 		return -1;
 	}
 
+	/* Stop early if this file's manifest would not fit in memory. */
+	if (manifest_check_memory(the_repository, sc->chunk_count + 1,
+				  &sc->error_message) < 0) {
+		sc->error_occurred = 1;
+		pthread_mutex_unlock(&w->mutex);
+		return -1;
+	}
+
 	/*
 	 * Write pre-compressed chunk to ODB via bulk checkin.
 	 * Worker has already created [pack_header][compressed_data] and computed OID.
@@ -504,15 +536,18 @@ static void *producer_thread_func(void *arg)
 	while (!sc->reading_done) {
 		ssize_t bytes_read = 0;
 
+		if (producer_should_stop(sc))
+			return producer_exit(sc);
+
 		/* Read next page */
 		if (sc->fd >= 0) {
 			/* File mode */
 			bytes_read = xread(sc->fd, sc->read_buffer, STREAMING_BUFFER_SIZE);
 			if (bytes_read < 0) {
-				strbuf_addf(&sc->error_message, "read error: %s", strerror(errno));
-				sc->error_occurred = 1;
+				/* error_message belongs to the main thread */
+				sc->producer_read_errno = errno;
 				sc->producer_error = 1;
-				return NULL;
+				return producer_exit(sc);
 			}
 		} else {
 			/* Buffer mode */
@@ -531,11 +566,13 @@ static void *producer_thread_func(void *arg)
 			if (sc->chunk_buffer.len > 0) {
 				if (dispatch_chunk_to_worker(sc) < 0) {
 					sc->producer_error = 1;
-					return NULL;
+					return producer_exit(sc);
 				}
 			}
+			pthread_mutex_lock(&sc->consumer_mutex);
 			sc->reading_done = 1;
 			sc->total_chunks = sc->next_chunk_to_produce;
+			pthread_mutex_unlock(&sc->consumer_mutex);
 			break;
 		}
 
@@ -592,7 +629,7 @@ static void *producer_thread_func(void *arg)
 					/* Dispatch chunk to worker */
 					if (dispatch_chunk_to_worker(sc) < 0) {
 						sc->producer_error = 1;
-						return NULL;
+						return producer_exit(sc);
 					}
 
 					/* Start new chunk with leftover bytes */
@@ -613,18 +650,30 @@ static void *producer_thread_func(void *arg)
 			/* Force chunk cut at max_size (safety limit) */
 			if (dispatch_chunk_to_worker(sc) < 0) {
 				sc->producer_error = 1;
-				return NULL;
+				return producer_exit(sc);
 			}
 		}
 	}
 
-	return NULL;
+	return producer_exit(sc);
+}
+
+/* Main thread, after the producer has been joined. */
+static void report_producer_error(struct streaming_chunker_threads *sc)
+{
+	if (sc->producer_read_errno)
+		strbuf_addf(&sc->error_message, "read error: %s",
+			    strerror(sc->producer_read_errno));
+	sc->error_occurred = 1;
 }
 
 int streaming_chunker_threads_process_file(struct streaming_chunker_threads *sc)
 {
 	/* Initialize producer state */
 	sc->producer_error = 0;
+	sc->producer_exited = 0;
+	sc->producer_read_errno = 0;
+	sc->stop_producer = 0;
 
 	/* Start producer thread - runs independently, reading and chunking file */
 	if (pthread_create(&sc->producer_thread, NULL, producer_thread_func, sc) != 0) {
@@ -638,11 +687,36 @@ int streaming_chunker_threads_process_file(struct streaming_chunker_threads *sc)
 	while (1) {
 		/* Try to consume next chunk in order */
 		int consume_result = consume_next_chunk(sc);
-		if (consume_result < 0)
-			return -1;  /* Error */
+		int producer_done, reading_done;
+		int total_chunks;
+
+		if (consume_result < 0) {
+			/*
+			 * Stop the producer and wait for it before returning:
+			 * the caller frees the buffers it reads into.
+			 */
+			pthread_mutex_lock(&sc->consumer_mutex);
+			sc->stop_producer = 1;
+			pthread_mutex_unlock(&sc->consumer_mutex);
+			pthread_join(sc->producer_thread, NULL);
+			return -1;
+		}
+
+		/* Flags the producer publishes under consumer_mutex. */
+		pthread_mutex_lock(&sc->consumer_mutex);
+		producer_done = sc->producer_exited;
+		reading_done = sc->reading_done;
+		total_chunks = sc->total_chunks;
+		pthread_mutex_unlock(&sc->consumer_mutex);
+		if (producer_done && sc->producer_error) {
+			/* The producer failed (read error); its chunks will never come. */
+			pthread_join(sc->producer_thread, NULL);
+			report_producer_error(sc);
+			return -1;
+		}
 
 		/* Exit condition: reading done AND all chunks consumed */
-		if (sc->reading_done && sc->next_chunk_to_consume >= sc->total_chunks) {
+		if (reading_done && sc->next_chunk_to_consume >= total_chunks) {
 			break;
 		}
 
@@ -669,6 +743,7 @@ int streaming_chunker_threads_process_file(struct streaming_chunker_threads *sc)
 
 	/* Check if producer encountered an error */
 	if (sc->producer_error) {
+		report_producer_error(sc);
 		return -1;
 	}
 
@@ -681,6 +756,24 @@ int streaming_chunker_threads_finalize(struct streaming_chunker_threads *sc,
 {
 	/* Finalize content hash */
 	the_hash_algo->final_oid_fn(content_oid, &sc->content_hash_ctx);
+
+	/*
+	 * content_oid's "blob <size>" header was hashed up front with the
+	 * size the file had when we opened it. If the file grew or shrank
+	 * while we read it, that header is wrong, so refuse (as git does).
+	 */
+	if (sc->fd >= 0 && chunker_file_changed(sc->fd, &sc->stamp,
+						 &sc->error_message)) {
+		sc->error_occurred = 1;
+		return -1;
+	}
+	if (sc->total_size != sc->expected_size) {
+		strbuf_addf(&sc->error_message,
+			    "file changed while reading (expected %"PRIu64" bytes, read %"PRIu64")",
+			    sc->expected_size, sc->total_size);
+		sc->error_occurred = 1;
+		return -1;
+	}
 
 	/* Create manifest object */
 	if (write_manifest_object(the_repository, manifest_oid, sc->total_size,

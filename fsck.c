@@ -523,7 +523,7 @@ static int fsck_walk_manifest(struct manifest *manifest, void *data, struct fsck
 	/* Parse manifest header to get chunk data location */
 	struct manifest_header header;
 	struct strbuf err = STRBUF_INIT;
-	if (validate_manifest_header(the_repository, manifest->buffer, manifest->size, &header, &err) < 0) {
+	if (parse_manifest(the_repository->hash_algo, manifest->buffer, manifest->size, 0, &header, &err) != MANIFEST_OK) {
 		error("manifest %s has invalid header: %s", oid_to_hex(&manifest->object.oid), err.buf);
 		strbuf_release(&err);
 		return -1;
@@ -1296,88 +1296,72 @@ int fsck_object(struct object *obj, void *data, unsigned long size,
 	return fsck_buffer(&obj->oid, obj->type, data, size, options);
 }
 
+static enum fsck_msg_id manifest_msg_id(enum manifest_error e)
+{
+	switch (e) {
+	case MANIFEST_ERR_BAD_VERSION:          return FSCK_MSG_MANIFEST_BAD_VERSION;
+	case MANIFEST_ERR_UNKNOWN_VERSION:      return FSCK_MSG_MANIFEST_UNKNOWN_VERSION;
+	case MANIFEST_ERR_BAD_TOTAL_SIZE:       return FSCK_MSG_MANIFEST_BAD_TOTAL_SIZE;
+	case MANIFEST_ERR_BAD_CONTENT_OID:      return FSCK_MSG_MANIFEST_BAD_CONTENT_OID;
+	case MANIFEST_ERR_BAD_CHUNK_COUNT:      return FSCK_MSG_MANIFEST_BAD_CHUNK_COUNT;
+	case MANIFEST_ERR_BAD_CHUNK_LINE:       return FSCK_MSG_MANIFEST_BAD_CHUNK_LINE;
+	case MANIFEST_ERR_CHUNK_COUNT_MISMATCH: return FSCK_MSG_MANIFEST_CHUNK_COUNT_MISMATCH;
+	case MANIFEST_ERR_SIZE_MISMATCH:        return FSCK_MSG_MANIFEST_SIZE_MISMATCH;
+	case MANIFEST_ERR_CHUNK_WRONG_TYPE:     return FSCK_MSG_MANIFEST_CHUNK_WRONG_TYPE;
+	case MANIFEST_ERR_CHUNK_SIZE_MISMATCH:  return FSCK_MSG_MANIFEST_CHUNK_SIZE_MISMATCH;
+	case MANIFEST_ERR_CHUNK_CORRUPT:        return FSCK_MSG_MANIFEST_CHUNK_CORRUPT;
+	case MANIFEST_ERR_CONTENT_MISMATCH:     return FSCK_MSG_MANIFEST_CONTENT_MISMATCH;
+	case MANIFEST_OK:
+		break;
+	}
+	BUG("no fsck message for manifest error %d", e);
+}
+
+/*
+ * Check a manifest's own bytes against the strict format rules. This runs
+ * for every manifest fsck_buffer() sees, including index-pack on a push,
+ * where the chunks are not local (on the gitbench server they never are),
+ * so it must not look at chunk objects; fsck_manifest_chunks() does that.
+ */
 static int fsck_manifest(const struct object_id *oid, const char *buf,
 			 unsigned long size, struct fsck_options *options)
 {
 	struct manifest_header header;
 	struct strbuf err = STRBUF_INIT;
-	struct oid_array chunk_oids = OID_ARRAY_INIT;
+	enum manifest_error e;
 	int ret = 0;
-	
-	
+
 	if (object_on_skiplist(options, oid))
 		return 0;
 
-	/* Step 1: Validate manifest header structure */
-	int validation_result = validate_manifest_header(the_repository, buf, size, &header, &err);
-	
-	if (validation_result < 0) {
-		const char *error_msg = err.buf;
-		
-		/* Map generic errors to specific fsck message IDs */
-		if (strstr(error_msg, "missing version"))
-			ret = report(options, oid, OBJ_MANIFEST, FSCK_MSG_MANIFEST_MISSING_VERSION, "%s", error_msg);
-		else if (strstr(error_msg, "invalid version"))
-			ret = report(options, oid, OBJ_MANIFEST, FSCK_MSG_MANIFEST_INVALID_VERSION, "%s", error_msg);
-		else if (strstr(error_msg, "version") && strstr(error_msg, "newer than supported"))
-			ret = report(options, oid, OBJ_MANIFEST, FSCK_MSG_MANIFEST_INVALID_VERSION, "%s", error_msg);
-		else if (strstr(error_msg, "missing total size"))
-			ret = report(options, oid, OBJ_MANIFEST, FSCK_MSG_MANIFEST_MISSING_SIZE, "%s", error_msg);
-		else if (strstr(error_msg, "missing.*content OID"))
-			ret = report(options, oid, OBJ_MANIFEST, FSCK_MSG_MANIFEST_MISSING_CONTENT_OID, "%s", error_msg);
-		else if (strstr(error_msg, "missing chunk count"))
-			ret = report(options, oid, OBJ_MANIFEST, FSCK_MSG_MANIFEST_MISSING_CHUNK_COUNT, "%s", error_msg);
-		else if (strstr(error_msg, "zero chunks"))
-			ret = report(options, oid, OBJ_MANIFEST, FSCK_MSG_MANIFEST_INVALID_CHUNK_COUNT, "%s", error_msg);
-		else if (strstr(error_msg, "too short"))
-			ret = report(options, oid, OBJ_MANIFEST, FSCK_MSG_MANIFEST_CHUNK_DATA_TOO_SHORT, "%s", error_msg);
-		else
-			ret = report(options, oid, OBJ_MANIFEST, FSCK_MSG_BAD_TYPE, "%s", error_msg);
-		
-		goto cleanup;
-	}
-	
-	/* Step 2: Extract chunk OIDs for validation */
-	if (get_manifest_chunk_oids(the_repository, oid, NULL, &chunk_oids) < 0) {
-		ret = report(options, oid, OBJ_MANIFEST, FSCK_MSG_BAD_TYPE, "failed to extract chunk OIDs");
-		goto cleanup;
-	}
-	
-	/* Step 3: Validate that all chunk objects exist and are blobs */
-	strbuf_reset(&err);
-	if (validate_manifest_chunks(the_repository, chunk_oids.oid, chunk_oids.nr, &err) < 0) {
-		const char *error_msg = err.buf;
-		
-		if (strstr(error_msg, "not found"))
-			ret = report(options, oid, OBJ_MANIFEST, FSCK_MSG_MANIFEST_CHUNK_MISSING, "%s", error_msg);
-		else if (strstr(error_msg, "expected blob"))
-			ret = report(options, oid, OBJ_MANIFEST, FSCK_MSG_MANIFEST_CHUNK_WRONG_TYPE, "%s", error_msg);
-		else
-			ret = report(options, oid, OBJ_MANIFEST, FSCK_MSG_BAD_TYPE, "%s", error_msg);
-		
-		goto cleanup;
-	}
-	
-	/* Step 4: Verify data integrity (expensive, but thorough) */
-	if (options->strict) {
-		strbuf_reset(&err);
-		if (verify_manifest_integrity(the_repository, &header, chunk_oids.oid, &err) < 0) {
-			const char *error_msg = err.buf;
-			
-			if (strstr(error_msg, "size mismatch"))
-				ret = report(options, oid, OBJ_MANIFEST, FSCK_MSG_MANIFEST_SIZE_MISMATCH, "%s", error_msg);
-			else if (strstr(error_msg, "content.*mismatch"))
-				ret = report(options, oid, OBJ_MANIFEST, FSCK_MSG_MANIFEST_CONTENT_MISMATCH, "%s", error_msg);
-			else
-				ret = report(options, oid, OBJ_MANIFEST, FSCK_MSG_BAD_TYPE, "%s", error_msg);
-			
-			goto cleanup;
-		}
-	}
-	
-cleanup:
+	e = parse_manifest(the_repository->hash_algo, buf, size, 0, &header, &err);
+	if (e != MANIFEST_OK)
+		ret = report(options, oid, OBJ_MANIFEST, manifest_msg_id(e),
+			     "%s", err.buf);
 	strbuf_release(&err);
-	oid_array_clear(&chunk_oids);
+	return ret;
+}
+
+int fsck_manifest_chunks(const struct object_id *oid, const char *buf,
+			 unsigned long size, struct fsck_options *options)
+{
+	struct manifest_header header;
+	struct strbuf err = STRBUF_INIT;
+	enum manifest_error e;
+	int ret = 0;
+
+	if (object_on_skiplist(options, oid))
+		return 0;
+
+	/* A manifest that fails to parse was already reported by fsck_manifest(). */
+	if (parse_manifest(the_repository->hash_algo, buf, size, 0, &header, NULL) != MANIFEST_OK)
+		return 0;
+
+	e = check_manifest_chunks(the_repository, &header, options->strict, &err);
+	if (e != MANIFEST_OK)
+		ret = report(options, oid, OBJ_MANIFEST, manifest_msg_id(e),
+			     "%s", err.buf);
+	strbuf_release(&err);
 	return ret;
 }
 

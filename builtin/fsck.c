@@ -433,6 +433,12 @@ static int fsck_obj(struct object *obj, void *buffer, unsigned long size)
 	if (err)
 		goto out;
 
+	if (obj->type == OBJ_MANIFEST) {
+		err = fsck_manifest_chunks(&obj->oid, buffer, size, &fsck_obj_options);
+		if (err)
+			goto out;
+	}
+
 	if (obj->type == OBJ_COMMIT) {
 		struct commit *commit = (struct commit *) obj;
 

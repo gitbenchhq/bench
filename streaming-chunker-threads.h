@@ -97,6 +97,8 @@ struct streaming_chunker_threads {
 
 	/* Total file stats */
 	uint64_t total_size;             /* Total bytes processed */
+	uint64_t expected_size;          /* Size hashed into the content_oid header */
+	struct chunker_file_stamp stamp; /* File size + mtime before reading (file mode) */
 
 	/* Worker pool */
 	struct worker_state *workers;    /* Array of worker threads */
@@ -105,6 +107,9 @@ struct streaming_chunker_threads {
 	/* Producer thread */
 	pthread_t producer_thread;       /* Thread for reading and chunking */
 	int producer_error;              /* Error flag for producer thread */
+	int producer_exited;             /* Producer returned (guarded by consumer_mutex) */
+	int producer_read_errno;         /* Producer's read error; reported by the main thread */
+	int stop_producer;               /* Consumer failed: producer must stop (consumer_mutex) */
 
 	/* Consumer synchronization */
 	pthread_mutex_t consumer_mutex;  /* Protects consumer state */

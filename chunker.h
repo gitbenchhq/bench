@@ -142,4 +142,28 @@ chunk_boundary_t find_chunk_boundary(const struct chunk_config *cfg,
  */
 void init_gear_table(void);
 
+/*
+ * A file's size and modification time, taken before chunking it, so the
+ * chunkers can refuse a file that was written while they read it. The
+ * size check alone misses an in-place rewrite that keeps the size (an
+ * instrument or simulation updating its output); mtime catches those.
+ * ctime is not compared: chmod/chown change it without touching content.
+ */
+struct chunker_file_stamp {
+	int valid;
+	off_t size;
+	time_t mtime;
+	unsigned int mtime_nsec;
+};
+
+/* Record fd's size and mtime. Leaves the stamp invalid if fstat fails. */
+void chunker_stamp_file(int fd, struct chunker_file_stamp *stamp);
+
+/*
+ * Return 1, with a message appended to err, if fd's size or mtime differs
+ * from the stamp; 0 if unchanged or the stamp is invalid.
+ */
+int chunker_file_changed(int fd, const struct chunker_file_stamp *stamp,
+			 struct strbuf *err);
+
 #endif /* CHUNKER_H */

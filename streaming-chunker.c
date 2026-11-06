@@ -72,6 +72,7 @@ static int streaming_chunker_init_common(struct streaming_chunker *sc, size_t da
 	 * This represents what Git would have computed if it hashed the data as one blob.
 	 */
 	struct strbuf header = STRBUF_INIT;
+	sc->expected_size = data_size;
 	strbuf_addf(&header, "blob %zu", data_size);
 	strbuf_addch(&header, '\0');
 
@@ -98,6 +99,7 @@ int streaming_chunker_init(struct streaming_chunker *sc, int fd, off_t file_size
 	sc->buffer = NULL;
 	sc->buffer_len = 0;
 	sc->buffer_pos = 0;
+	chunker_stamp_file(fd, &sc->stamp);
 
 	return streaming_chunker_init_common(sc, (size_t)file_size);
 }
@@ -125,6 +127,13 @@ static int finalize_current_chunk(struct streaming_chunker *sc)
 
 	if (sc->chunk_buffer.len == 0)
 		return 0;  /* Empty chunk, nothing to do */
+
+	/* Stop early if this file's manifest would not fit in memory. */
+	if (manifest_check_memory(the_repository, sc->chunk_count + 1,
+				  &sc->error_message) < 0) {
+		sc->error_occurred = 1;
+		return -1;
+	}
 
 	/* Write chunk as a blob object using bulk checkin for performance.
 	 * This packs all chunks together instead of creating loose objects. */
@@ -343,6 +352,24 @@ int streaming_chunker_finalize(struct streaming_chunker *sc,
 	}
 
 	the_hash_algo->final_oid_fn(content_oid, &sc->content_hash_ctx);
+
+	/*
+	 * content_oid's "blob <size>" header was hashed up front with the
+	 * size the file had when we opened it. If the file grew or shrank
+	 * while we read it, that header is wrong, so refuse (as git does).
+	 */
+	if (sc->fd >= 0 && chunker_file_changed(sc->fd, &sc->stamp,
+						 &sc->error_message)) {
+		sc->error_occurred = 1;
+		return -1;
+	}
+	if (sc->total_size != sc->expected_size) {
+		strbuf_addf(&sc->error_message,
+			    "file changed while reading (expected %"PRIu64" bytes, read %"PRIu64")",
+			    sc->expected_size, sc->total_size);
+		sc->error_occurred = 1;
+		return -1;
+	}
 
 	/* Create manifest object */
 	if (write_manifest_object(the_repository, manifest_oid, sc->total_size,
