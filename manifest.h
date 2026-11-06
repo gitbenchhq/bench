@@ -21,24 +21,38 @@ struct manifest {
 struct manifest *lookup_manifest(struct repository *r, const struct object_id *oid);
 
 /**
- * Parse a manifest buffer and extract the chunk OID references.
- * Format: One hex OID per line (40 chars for SHA-1, 64 for SHA-256).
- * Returns 0 on success, -1 on error.
+ * Attach a manifest's raw buffer to its object (parsed lazily by readers).
+ *
+ * Manifest format (version 1, the release format; context/architecture/
+ * client.md section 6.3 in the gitbench platform repo is canonical):
+ *
+ *	1 LF                          version
+ *	<total_size> LF               sum of the chunk sizes
+ *	<content_oid> LF              git blob id of the whole file:
+ *	                              hash("blob <total_size>\0" + content)
+ *	<chunk_count> LF
+ *	<chunk_oid> SP <size> LF      once per chunk, in file order
+ *
+ * Numbers are canonical decimal, OIDs lowercase hex, nothing follows the
+ * last line. Returns 0 on success, -1 on error.
  **/
 int parse_manifest_buffer(struct repository *r, struct manifest *item, void *buffer, unsigned long size);
 
 
 /**
  * Write a manifest object directly to the object database.
- * This is a simplified interface for object-file.c that handles the manifest
- * format internally based on the configured version.
+ * chunk_sizes[i] is the uncompressed size of chunk_oids[i]; total_size
+ * must equal their sum. Always writes the release format (version 1):
+ * the format is fixed by the bench release, never by configuration, so
+ * the same chunks always produce the same manifest bytes.
  * Returns 0 on success, -1 on error.
  **/
 int write_manifest_object(struct repository *r, struct object_id *oid,
-                         unsigned long total_size,
+                         uint64_t total_size,
                          const struct object_id *content_oid,
                          size_t chunk_count,
-                         const struct object_id *chunk_oids);
+                         const struct object_id *chunk_oids,
+                         const uint64_t *chunk_sizes);
 
 /**
  * Hash a manifest object without writing it to the database.
@@ -47,10 +61,11 @@ int write_manifest_object(struct repository *r, struct object_id *oid,
  * Returns 0 on success, -1 on error.
  **/
 int hash_manifest_object(struct repository *r, struct object_id *oid,
-                        unsigned long total_size,
+                        uint64_t total_size,
                         const struct object_id *content_oid,
                         size_t chunk_count,
-                        const struct object_id *chunk_oids);
+                        const struct object_id *chunk_oids,
+                        const uint64_t *chunk_sizes);
 
 /**
  * Get the content OID from a manifest object.
@@ -119,7 +134,7 @@ int stream_manifest_to_fd_filtered(struct repository *r, int fd,
  **/
 int get_manifest_chunk_oids(struct repository *r,
                            const struct object_id *manifest_oid,
-                           unsigned long *total_size,
+                           uint64_t *total_size,
                            struct oid_array *chunk_oids);
 
 /**
@@ -141,7 +156,7 @@ void *read_manifest_content(struct repository *r,
  **/
 int get_manifest_size(struct repository *r,
                      const struct object_id *manifest_oid,
-                     unsigned long *size);
+                     uint64_t *size);
 
 /* Validation functions for fsck */
 struct strbuf;
@@ -149,11 +164,11 @@ struct strbuf;
 /* Manifest header structure for validation */
 struct manifest_header {
 	int version;
-	unsigned long total_size;
+	uint64_t total_size;
 	struct object_id content_oid;  /* OID of complete file content (after filters) */
 	size_t chunk_count;
-	const char *chunk_data;  /* Pointer to start of chunk OID data */
-	size_t chunk_data_len;   /* Length of chunk OID data in bytes */
+	const char *chunk_data;  /* Pointer to the first "<oid> <size>" line */
+	size_t chunk_data_len;   /* Length of the chunk lines in bytes */
 };
 
 /**

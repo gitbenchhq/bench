@@ -357,7 +357,7 @@ static enum list_objects_filter_result filter_blobs_limit(
 		 * potentially large file content.
 		 */
 		{
-			unsigned long total_size = 0;
+			uint64_t total_size = 0;
 			
 			/* Get only the total size from the manifest header - no need for chunk OIDs */
 			if (get_manifest_chunk_oids(r, &obj->oid, &total_size, NULL) < 0) {

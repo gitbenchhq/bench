@@ -1459,12 +1459,13 @@ int index_path(struct index_state *istate, struct object_id *oid,
 				 * For single chunk, content OID equals chunk OID.
 				 * Use chunk_size (filtered size) not st->st_size (working tree size).
 				 */
+				uint64_t size64 = chunk_size;
 				if (flags & INDEX_WRITE_OBJECT) {
-					if (write_manifest_object(repo, oid, chunk_size, &chunk_oid, 1, &chunk_oid) < 0)
+					if (write_manifest_object(repo, oid, size64, &chunk_oid, 1, &chunk_oid, &size64) < 0)
 						rc = error(_("%s: failed to create manifest"), path);
 				} else {
 					/* Just hashing - create manifest hash without writing */
-					if (hash_manifest_object(repo, oid, chunk_size, &chunk_oid, 1, &chunk_oid) < 0)
+					if (hash_manifest_object(repo, oid, size64, &chunk_oid, 1, &chunk_oid, &size64) < 0)
 						rc = error(_("%s: failed to hash manifest"), path);
 				}
 			} else if (would_convert_to_git(istate, path)) {
@@ -1554,12 +1555,13 @@ int index_path(struct index_state *istate, struct object_id *oid,
 		if (in_bench_mode) {
 			/* In bench mode: create chunk, then manifest for symlink */
 			struct object_id chunk_oid;
+			uint64_t size64 = sb.len;
 			
 			if (!(flags & INDEX_WRITE_OBJECT)) {
 				/* Just hashing */
 				hash_object_file(the_hash_algo, sb.buf, sb.len,
 						 OBJ_BLOB, &chunk_oid);
-				if (hash_manifest_object(repo, oid, sb.len, &chunk_oid, 1, &chunk_oid) < 0)
+				if (hash_manifest_object(repo, oid, size64, &chunk_oid, 1, &chunk_oid, &size64) < 0)
 					rc = error(_("%s: failed to hash manifest"), path);
 			} else {
 				/* Write chunk */
@@ -1567,7 +1569,7 @@ int index_path(struct index_state *istate, struct object_id *oid,
 					rc = error(_("%s: failed to insert chunk into database"), path);
 				else {
 					/* Create manifest */
-					if (write_manifest_object(repo, oid, sb.len, &chunk_oid, 1, &chunk_oid) < 0)
+					if (write_manifest_object(repo, oid, size64, &chunk_oid, 1, &chunk_oid, &size64) < 0)
 						rc = error(_("%s: failed to create manifest"), path);
 				}
 			}

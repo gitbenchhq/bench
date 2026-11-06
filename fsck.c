@@ -497,6 +497,7 @@ static int fsck_walk_manifest(struct manifest *manifest, void *data, struct fsck
 	struct manifest_desc desc;
 	const char *name;
 	int res = 0;
+	int res_entry;
 	int chunk_idx = 0;
 
 	/* Get manifest name for object naming */
@@ -534,7 +535,7 @@ static int fsck_walk_manifest(struct manifest *manifest, void *data, struct fsck
 			   the_repository->hash_algo);
 
 	/* Walk each chunk blob */
-	while (manifest_entry(&desc)) {
+	while ((res_entry = manifest_entry(&desc)) > 0) {
 		struct object *obj;
 		int result;
 
@@ -550,6 +551,9 @@ static int fsck_walk_manifest(struct manifest *manifest, void *data, struct fsck
 			res = result;
 		chunk_idx++;
 	}
+	if (res_entry < 0)
+		return error("manifest %s has a malformed chunk line",
+			     oid_to_hex(&manifest->object.oid));
 
 	return res;
 }

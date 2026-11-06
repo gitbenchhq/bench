@@ -73,7 +73,7 @@ static void mark_blob_uninteresting(struct blob *blob)
 static void mark_manifest_uninteresting(struct manifest *manifest)
 {
 	struct oid_array chunk_oids = OID_ARRAY_INIT;
-	unsigned long total_size;
+	uint64_t total_size;
 	size_t i;
 
 	if (!manifest)

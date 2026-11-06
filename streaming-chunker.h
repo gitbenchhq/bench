@@ -44,6 +44,7 @@ struct streaming_chunker {
 
 	/* Completed chunks */
 	struct object_id *chunk_oids;    /* Array of completed chunk OIDs */
+	uint64_t *chunk_sizes;           /* Uncompressed size of each chunk */
 	size_t chunk_count;              /* Number of chunks created */
 	size_t chunk_capacity;           /* Allocated capacity for chunk_oids */
 

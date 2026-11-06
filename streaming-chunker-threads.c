@@ -306,6 +306,7 @@ static int streaming_chunker_threads_init_common(struct streaming_chunker_thread
 	/* Initialize arrays for chunk OIDs */
 	sc->chunk_capacity = 16;  /* Start small, grow as needed */
 	sc->chunk_oids = xcalloc(sc->chunk_capacity, sizeof(struct object_id));
+	sc->chunk_sizes = xcalloc(sc->chunk_capacity, sizeof(uint64_t));
 	sc->chunk_count = 0;
 
 	/* Initialize chunk buffer - holds current chunk being built by producer */
@@ -471,9 +472,11 @@ static int consume_next_chunk(struct streaming_chunker_threads *sc)
 	if (sc->chunk_count >= sc->chunk_capacity) {
 		sc->chunk_capacity *= 2;
 		REALLOC_ARRAY(sc->chunk_oids, sc->chunk_capacity);
+		REALLOC_ARRAY(sc->chunk_sizes, sc->chunk_capacity);
 	}
 
 	oidcpy(&sc->chunk_oids[sc->chunk_count], &w->chunk_oid);
+	sc->chunk_sizes[sc->chunk_count] = w->input_size;
 	sc->chunk_count++;
 
 	/* Mark worker as idle */
@@ -682,7 +685,7 @@ int streaming_chunker_threads_finalize(struct streaming_chunker_threads *sc,
 	/* Create manifest object */
 	if (write_manifest_object(the_repository, manifest_oid, sc->total_size,
 	                          content_oid, sc->chunk_count,
-	                          sc->chunk_oids) < 0) {
+	                          sc->chunk_oids, sc->chunk_sizes) < 0) {
 		strbuf_addstr(&sc->error_message, "failed to create manifest object");
 		sc->error_occurred = 1;
 		return -1;
@@ -698,6 +701,7 @@ void streaming_chunker_threads_cleanup(struct streaming_chunker_threads *sc)
 	strbuf_release(&sc->chunk_buffer);
 	strbuf_release(&sc->error_message);
 	free(sc->chunk_oids);
+	free(sc->chunk_sizes);
 
 	memset(sc, 0, sizeof(*sc));
 }

@@ -114,7 +114,7 @@ static void process_manifest(struct traversal_context *ctx,
 	struct object *obj = &manifest->object;
 	size_t pathlen;
 	enum list_objects_filter_result r;
-	unsigned long total_size = 0;
+	uint64_t total_size = 0;
 	struct oid_array chunk_oids = OID_ARRAY_INIT;
 	size_t i;
 

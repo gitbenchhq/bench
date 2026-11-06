@@ -8,47 +8,66 @@ void init_manifest_desc(struct manifest_desc *desc, const void *buffer, unsigned
 	desc->size = size;
 	desc->algo = algo;
 	oidclr(&desc->entry_oid, algo);
+	desc->entry_size = 0;
+}
+
+int manifest_parse_u64(const char *p, const char *end, uint64_t *value, const char **next)
+{
+	uint64_t v = 0;
+	const char *start = p;
+
+	while (p < end && isdigit(*p)) {
+		unsigned digit = *p - '0';
+		if (v > (UINT64_MAX - digit) / 10)
+			return -1; /* overflow */
+		v = v * 10 + digit;
+		p++;
+	}
+	if (p == start)
+		return -1; /* no digits */
+	if (*start == '0' && p - start > 1)
+		return -1; /* leading zero */
+
+	*value = v;
+	*next = p;
+	return 0;
 }
 
 /*
- * Parse the next OID from the manifest buffer.
- * Manifest format: one hex OID per line (40 chars for SHA-1, 64 for SHA-256)
+ * Parse the next "<oid> <size>\n" line. The OID must be exactly the
+ * repository hash's hex length in lowercase; the line must end in '\n'.
  */
 int manifest_entry(struct manifest_desc *desc)
 {
 	const char *buf = desc->buffer;
-	const char *end;
-	size_t line_len;
+	const char *end = buf + desc->size;
+	const char *p;
+	size_t hexsz = desc->algo->hexsz;
+	size_t i;
 
 	if (!desc->size)
 		return 0;
 
-	/* Find end of line or end of buffer */
-	end = memchr(buf, '\n', desc->size);
-	if (!end)
-		end = buf + desc->size;
-
-	line_len = end - buf;
-
-	/* Skip empty lines */
-	if (line_len == 0) {
-		desc->buffer = end + 1;
-		desc->size -= 1;
-		return manifest_entry(desc);
+	if (desc->size < hexsz + 1)
+		return -1;
+	for (i = 0; i < hexsz; i++) {
+		char c = buf[i];
+		if (!(('0' <= c && c <= '9') || ('a' <= c && c <= 'f')))
+			return -1; /* not lowercase hex */
 	}
-
-	/* Parse the OID */
 	if (get_oid_hex_algop(buf, &desc->entry_oid, desc->algo) < 0)
-		return 0; /* Invalid OID */
+		return -1;
 
-	/* Advance buffer past this line */
-	if (*end == '\n') {
-		desc->buffer = end + 1;
-		desc->size -= line_len + 1;
-	} else {
-		desc->buffer = end;
-		desc->size = 0;
-	}
+	p = buf + hexsz;
+	if (*p++ != ' ')
+		return -1;
+	if (manifest_parse_u64(p, end, &desc->entry_size, &p) < 0)
+		return -1;
+	if (p >= end || *p != '\n')
+		return -1;
+	p++;
 
+	desc->size -= p - buf;
+	desc->buffer = p;
 	return 1;
 }

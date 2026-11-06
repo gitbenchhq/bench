@@ -2112,7 +2112,7 @@ static int merge_3way(struct merge_options *opt,
 	    (a && odb_read_object_info(the_repository->objects, a, NULL) == OBJ_MANIFEST) ||
 	    (b && odb_read_object_info(the_repository->objects, b, NULL) == OBJ_MANIFEST)) {
 		
-		unsigned long logical_size;
+		uint64_t logical_size;
 		
 		
 		if (o && odb_read_object_info(the_repository->objects, o, NULL) == OBJ_MANIFEST) {

@@ -4246,9 +4246,11 @@ int diff_populate_filespec(struct repository *r,
 object_read:
 		/* Handle manifest objects with early size detection */
 		if (type == OBJ_MANIFEST) {
-			unsigned long logical_size;
+			uint64_t logical_size;
 			if (!get_manifest_size(r, &s->oid, &logical_size)) {
-				s->size = logical_size;
+				/* MAX_XDIFF_SIZE is below ULONG_MAX, so a size that
+				 * would not fit is caught by the binary check below. */
+				s->size = logical_size > ULONG_MAX ? ULONG_MAX : (unsigned long)logical_size;
 				/* Check if manifest content is too large for libxdiff */
 				if (logical_size > MAX_XDIFF_SIZE) {
 					/* Large file: mark as binary and skip content loading entirely */
