@@ -1517,11 +1517,15 @@ int index_path(struct index_state *istate, struct object_id *oid,
 				} else {
 					/*
 					 * Large file (> 512MB) with filters:
-					 * Show error + stream chunk without filters
+					 * Warn and stream the chunks without filters
 					 */
-					error(_("%s: file larger than %lu MB has text filters configured"),
-					      path, big_file_threshold / (1024 * 1024));
-					error(_("filters will NOT be applied (file too large)"));
+					struct strbuf lim = STRBUF_INIT;
+
+					strbuf_humanise_bytes(&lim, big_file_threshold);
+					warning(_("%s: larger than %s (core.bigFileThreshold), so its "
+						  "filters are not applied; it is stored unfiltered"),
+						path, lim.buf);
+					strbuf_release(&lim);
 
 					/* Fall through to streaming chunker (no filters) */
 					/* BENCH_THREADS: Use parallel or serial path based on settings */

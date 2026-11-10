@@ -710,7 +710,11 @@ void *read_manifest_content(struct repository *r,
 	if (!stream)
 		return NULL;
 	
-	content = xmalloc(manifest_size);
+	/*
+	 * NUL-terminated, like every git object buffer: callers such as
+	 * symlink checkout pass it to functions that expect a C string.
+	 */
+	content = xmallocz(manifest_size);
 	while (total_read < manifest_size) {
 		bytes_read = read_manifest_stream(stream,
 		                                  (char *)content + total_read,

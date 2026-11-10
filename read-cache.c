@@ -283,6 +283,25 @@ static int ce_compare_link(const struct cache_entry *ce, size_t expected_size)
 		return -1;
 
 	buffer = odb_read_object(the_repository->objects, &ce->oid, &type, &size);
+	if (buffer && type == OBJ_MANIFEST) {
+		/*
+		 * bench stores a symlink's target as a manifest: compare the
+		 * target it holds, not the manifest's own bytes. Check the
+		 * size from the manifest header first, so a manifest that is
+		 * not a link-sized target is never read into memory.
+		 */
+		struct manifest_header header;
+
+		if (parse_manifest(the_repository->hash_algo, buffer, size,
+				   MANIFEST_PARSE_HEADER_ONLY, &header, NULL) ||
+		    header.total_size != sb.len) {
+			free(buffer);
+			strbuf_release(&sb);
+			return -1;
+		}
+		free(buffer);
+		buffer = read_manifest_content(the_repository, &ce->oid, &size);
+	}
 	if (buffer) {
 		if (size == sb.len)
 			match = memcmp(buffer, sb.buf, size);

@@ -16,6 +16,7 @@
 #include "entry.h"
 #include "parallel-checkout.h"
 #include "manifest.h"
+#include "repo-settings.h"
 #include "repository.h"
 
 static void create_directories(const char *path, int path_len,
@@ -91,6 +92,14 @@ static int create_file(const char *path, unsigned int mode)
 	return open(path, O_WRONLY | O_CREAT | O_EXCL, mode);
 }
 
+/*
+ * The longest symlink target any platform allows, rounded up: Linux 4096
+ * bytes, macOS 1024, Windows long paths 32767 UTF-16 units (about 98 KB
+ * as UTF-8). Generous on purpose: this only bounds memory, the OS still
+ * refuses a target too long for it.
+ */
+#define MAX_SYMLINK_TARGET (128 * 1024)
+
 void *read_blob_entry(const struct cache_entry *ce, size_t *size)
 {
 	enum object_type type;
@@ -103,10 +112,29 @@ void *read_blob_entry(const struct cache_entry *ce, size_t *size)
 		if (type == OBJ_BLOB)
 			return blob_data;
 		if (type == OBJ_MANIFEST) {
-			/* For manifests, read the actual content.
-			 * This is only used for symlinks since regular files
-			 * are always streamed for manifests. */
+			/*
+			 * This loads the whole content, so it is only for a
+			 * symlink target (regular files are streamed). Check the
+			 * size from the manifest header first: a corrupt or
+			 * crafted tree entry pointing at a large file's manifest
+			 * must not be read into memory.
+			 */
+			struct manifest_header header;
+
+			if (parse_manifest(the_repository->hash_algo, blob_data, ul,
+					   MANIFEST_PARSE_HEADER_ONLY, &header, NULL)) {
+				free(blob_data);
+				error(_("%s: invalid manifest %s"), ce->name,
+				      oid_to_hex(&ce->oid));
+				return NULL;
+			}
 			free(blob_data); /* Free the manifest object itself */
+			if (header.total_size > MAX_SYMLINK_TARGET) {
+				error(_("%s: refusing to load %"PRIu64" bytes into memory: "
+					"a symlink target is at most %d bytes"),
+				      ce->name, header.total_size, MAX_SYMLINK_TARGET);
+				return NULL;
+			}
 			return read_manifest_content(the_repository, &ce->oid, size);
 		}
 		free(blob_data);
@@ -116,7 +144,8 @@ void *read_blob_entry(const struct cache_entry *ce, size_t *size)
 
 static int open_output_fd(char *path, const struct cache_entry *ce, int to_tempfile)
 {
-	int symlink = (ce->ce_mode & S_IFMT) != S_IFREG;
+	/* A manifest is a regular file, so it keeps its executable bit. */
+	int symlink = !S_ISREG(ce->ce_mode) && !S_ISMANIFEST(ce->ce_mode);
 	if (to_tempfile) {
 		xsnprintf(path, TEMPORARY_FILENAME_LENGTH, "%s",
 			  symlink ? ".merge_link_XXXXXX" : ".merge_file_XXXXXX");
@@ -334,13 +363,43 @@ static int write_entry(struct cache_entry *ce, char *path, struct conv_attrs *ca
 	}
 	
 	/*
-	 * Always try streaming for manifests to handle large files efficiently.
-	 * Manifests should avoid loading terabytes into memory.
+	 * Manifests are streamed, so a large file is never loaded into
+	 * memory. The exception is a conversion that needs the whole file
+	 * (text=auto / core.autocrlf, clean/smudge filters, working-tree-
+	 * encoding): git has no streaming filter for those, so, like bench
+	 * add, apply them in memory for a file up to core.bigFileThreshold
+	 * (the S_IFREG code below) and write a larger file unconverted,
+	 * which matches what add stored for it.
 	 */
 	if (ce_mode_s_ifmt == S_IFMANIFEST) {
 		struct stream_filter *filter = get_stream_filter_ca(ca, &ce->oid);
-		if (!streaming_write_entry(ce, path, filter, state, to_tempfile, &fstat_done, &st))
-			goto finish;
+		int stream = 1;
+
+		if (!filter) {
+			uint64_t file_size;
+			unsigned long limit = repo_settings_get_big_file_threshold(the_repository);
+
+			if (get_manifest_size(the_repository, &ce->oid, &file_size) < 0)
+				return error("unable to read manifest of %s (%s)",
+					     ce->name, oid_to_hex(&ce->oid));
+			if (file_size <= limit) {
+				stream = 0;
+			} else {
+				struct strbuf lim = STRBUF_INIT;
+
+				strbuf_humanise_bytes(&lim, limit);
+				warning(_("%s: larger than %s (core.bigFileThreshold), so its "
+					  "filters are not applied (it was stored unfiltered)"),
+					ce->name, lim.buf);
+				strbuf_release(&lim);
+			}
+		}
+		if (stream) {
+			if (!streaming_write_entry(ce, path, filter, state, to_tempfile,
+						   &fstat_done, &st))
+				goto finish;
+			return error("unable to write file %s", path);
+		}
 	}
 
 	switch (ce_mode_s_ifmt) {
@@ -363,6 +422,7 @@ static int write_entry(struct cache_entry *ce, char *path, struct conv_attrs *ca
 			return error_errno("unable to create symlink %s", path);
 		break;
 
+	case S_IFMANIFEST:	/* only here for an in-memory conversion (above) */
 	case S_IFREG:
 		/*
 		 * Fallback for regular files when streaming is not available
@@ -377,6 +437,15 @@ static int write_entry(struct cache_entry *ce, char *path, struct conv_attrs *ca
 		if (dco && dco->state == CE_RETRY) {
 			new_blob = NULL;
 			size = 0;
+		} else if (ce_mode_s_ifmt == S_IFMANIFEST) {
+			/* Size already checked against core.bigFileThreshold. */
+			unsigned long ul;
+
+			new_blob = read_manifest_content(the_repository, &ce->oid, &ul);
+			if (!new_blob)
+				return error("unable to read manifest of %s (%s)",
+					     ce->name, oid_to_hex(&ce->oid));
+			size = ul;
 		} else {
 			new_blob = read_blob_entry(ce, &size);
 			if (!new_blob)
