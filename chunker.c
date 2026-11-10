@@ -1,5 +1,6 @@
 #include "git-compat-util.h"
 #include "chunker.h"
+#include "parse.h"
 #include "strbuf.h"
 #include "hash.h"
 #include "repository.h"
@@ -106,13 +107,9 @@ void init_chunk_config_custom(struct chunk_config *cfg, int target_bits)
  *    0: Empty buffer
  *   >0: Boundary found at this byte offset
  *
- * The caller is responsible for:
- *   - EOF handling (detecting end of file)
- *   - min_size enforcement (ignoring boundaries before min_size)
- *   - max_size enforcement (forcing cuts at max_size)
- *
- * The fingerprint state is maintained across calls to handle files
- * larger than the buffer size.
+ * This is the hash scan only: cdc_feed() below applies min_size, max_size
+ * and the fingerprint reset around it. The fingerprint state is kept
+ * across calls, so a chunk can span several reads.
  */
 chunk_boundary_t find_chunk_boundary(const struct chunk_config *cfg,
 				     const unsigned char *data,
@@ -167,17 +164,63 @@ chunk_boundary_t find_chunk_boundary(const struct chunk_config *cfg,
 		}
 	}
 
-	/*
-	 * No boundary found in this buffer.
-	 * Return -1 to signal "keep accumulating bytes".
-	 *
-	 * The caller should:
-	 *   - Add these bytes to current chunk
-	 *   - Check if max_size exceeded (force cut if so)
-	 *   - Continue reading more data
-	 */
+	/* No boundary in this buffer: the chunk continues. */
 	*fingerprint = fp;
 	return -1;
+}
+
+size_t cdc_feed(const struct chunk_config *cfg, struct cdc_state *st,
+		const unsigned char *buf, size_t n, int *cut)
+{
+	size_t max = cfg->max_size ? cfg->max_size : 1;
+	size_t take, skip = 0;
+
+	*cut = 0;
+	if (!n)
+		return 0;
+	if (st->len >= max)
+		BUG("cdc_feed: chunk already at max_size");
+
+	/* Never past max: at most the bytes that fit in this chunk. */
+	take = max - st->len;
+	if (take > n)
+		take = n;
+
+	/* The first min_size bytes of a chunk are not hashed. */
+	if (st->len < cfg->min_size) {
+		skip = cfg->min_size - st->len;
+		if (skip > take)
+			skip = take;
+	}
+
+	if (skip < take) {
+		chunk_boundary_t b = find_chunk_boundary(cfg, buf + skip,
+							 take - skip, &st->fp);
+		if (b > 0) {
+			take = skip + b;
+			*cut = 1;
+		}
+	}
+
+	st->len += take;
+	if (st->len == max)
+		*cut = 1;
+	if (*cut) {
+		st->len = 0;
+		st->fp = 0;
+	}
+	return take;
+}
+
+size_t chunker_read_size(size_t buf_size)
+{
+	unsigned long n = git_env_ulong("GIT_TEST_BENCH_READ_SIZE", buf_size);
+
+	if (n < 1)
+		n = 1;
+	if (n > buf_size)
+		n = buf_size;
+	return n;
 }
 
 void chunker_stamp_file(int fd, struct chunker_file_stamp *stamp)

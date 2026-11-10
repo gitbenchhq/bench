@@ -36,11 +36,11 @@ struct streaming_chunker {
 
 	/* Chunker state */
 	struct chunk_config chunk_config; /* Chunking configuration */
-	uint64_t fingerprint;            /* Rolling hash state */
-	size_t current_chunk_size;       /* Size of current chunk */
+	struct cdc_state cdc;            /* Current chunk's length and gear fingerprint */
+	size_t read_size;                /* Bytes per read (STREAMING_BUFFER_SIZE) */
 
 	/* Current chunk being built */
-	struct strbuf chunk_buffer;      /* Buffer for current chunk (max 128MB) */
+	struct strbuf chunk_buffer;      /* Buffer for current chunk (at most chunk.maxSize) */
 
 	/* Completed chunks */
 	struct object_id *chunk_oids;    /* Array of completed chunk OIDs */

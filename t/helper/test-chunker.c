@@ -77,12 +77,11 @@ static int test_sizes(void)
 static int test_file(const char *filename)
 {
 	struct chunk_config cfg;
-	uint64_t fp = 0;
-	int fd;
-	unsigned char buffer[64 * 1024];  /* 64KB read buffer */
+	struct cdc_state st = CDC_STATE_INIT;
+	unsigned char buffer[64 * 1024];
 	ssize_t nread;
-	size_t current_chunk_size = 0;
-	int chunk_count = 0;
+	size_t len = 0;
+	int fd, chunk_count = 0;
 
 	fd = open(filename, O_RDONLY);
 	if (fd < 0) {
@@ -90,72 +89,85 @@ static int test_file(const char *filename)
 		return 1;
 	}
 
-	/* Use 2MB min, 16MB target, 64MB max */
 	init_chunk_config(&cfg);
 	printf("Chunking file: %s\n", filename);
-	printf("Config: min=%zuMB target=16MB max=%zuMB\n",
-	       cfg.min_size / (1024 * 1024),
-	       cfg.max_size / (1024 * 1024));
-
 	while ((nread = read(fd, buffer, sizeof(buffer))) > 0) {
-		chunk_boundary_t boundary;
+		size_t pos = 0;
 
-		boundary = find_chunk_boundary(&cfg, buffer, nread, &fp);
+		while (pos < (size_t)nread) {
+			int cut;
+			size_t take = cdc_feed(&cfg, &st, buffer + pos, nread - pos, &cut);
 
-		if (boundary < 0) {
-			/* No boundary found, accumulate bytes */
-			current_chunk_size += nread;
-
-			/* Enforce max_size */
-			if (current_chunk_size >= cfg.max_size) {
-				chunk_count++;
-				printf("  Chunk %d: %zu bytes (forced at max_size)\n",
-				       chunk_count, current_chunk_size);
-				current_chunk_size = 0;
-				fp = 0;  /* Reset for next chunk */
-			}
-		} else if (boundary > 0) {
-			/* Boundary found */
-			current_chunk_size += boundary;
-
-			/* Enforce min_size */
-			if (current_chunk_size >= cfg.min_size) {
-				chunk_count++;
-				printf("  Chunk %d: %zu bytes (content-defined boundary)\n",
-				       chunk_count, current_chunk_size);
-				current_chunk_size = 0;
-				fp = 0;  /* Reset for next chunk */
-
-				/* Process remaining bytes in buffer after boundary */
-				if (boundary < nread) {
-					/* There are more bytes after the boundary */
-					current_chunk_size = nread - boundary;
-				}
-			} else {
-				/* Too small, ignore boundary and keep accumulating */
-				printf("  [Ignoring boundary at %zu bytes, below min_size]\n",
-				       current_chunk_size);
+			pos += take;
+			len += take;
+			if (cut) {
+				printf("  Chunk %d: %zu bytes\n", ++chunk_count, len);
+				len = 0;
 			}
 		}
-		/* boundary == 0 means empty buffer, shouldn't happen */
 	}
-
 	close(fd);
-
-	/* Handle final chunk at EOF */
-	if (current_chunk_size > 0) {
-		chunk_count++;
-		printf("  Chunk %d: %zu bytes (final, EOF)\n", chunk_count, current_chunk_size);
-	}
-
+	if (len)
+		printf("  Chunk %d: %zu bytes (final, EOF)\n", ++chunk_count, len);
 	printf("Total chunks: %d\n", chunk_count);
+	return 0;
+}
+
+/*
+ * Reference cutter: the cut rule applied one byte at a time, with no
+ * buffers, partial reads or leftovers. Prints each chunk's size on its
+ * own line. The streaming chunkers must produce exactly these sizes.
+ */
+static int test_reference(const char *min_s, const char *target_s,
+			  const char *max_s, const char *filename)
+{
+	struct chunk_config cfg;
+	size_t min = strtoul(min_s, NULL, 10), max = strtoul(max_s, NULL, 10);
+	unsigned long target = strtoul(target_s, NULL, 10);
+	size_t len = 0;
+	uint64_t fp = 0;
+	int bits = 0, c;
+	FILE *f = fopen(filename, "rb");
+
+	if (!f) {
+		perror("fopen");
+		return 1;
+	}
+	while (target > 1) {
+		target >>= 1;
+		bits++;
+	}
+	init_chunk_config(&cfg);
+	cfg.min_size = min;
+	cfg.max_size = max;
+	cfg.mask = (1ULL << bits) - 1;
+
+	while ((c = getc(f)) != EOF) {
+		unsigned char b = c;
+		int cut = 0;
+
+		len++;
+		/* bytes 1..min of a chunk are not hashed */
+		if (len > min && find_chunk_boundary(&cfg, &b, 1, &fp) > 0)
+			cut = 1;
+		if (len == max)
+			cut = 1;
+		if (cut) {
+			printf("%"PRIuMAX"\n", (uintmax_t)len);
+			len = 0;
+			fp = 0;
+		}
+	}
+	if (len)
+		printf("%"PRIuMAX"\n", (uintmax_t)len);
+	fclose(f);
 	return 0;
 }
 
 int cmd__chunker(int argc, const char **argv)
 {
 	if (argc < 2) {
-		fprintf(stderr, "usage: test-tool chunker <test|sizes|file PATH>\n");
+		fprintf(stderr, "usage: test-tool chunker <test|sizes|file PATH|reference MIN TARGET MAX PATH>\n");
 		return 1;
 	}
 
@@ -163,7 +175,13 @@ int cmd__chunker(int argc, const char **argv)
 		return test_simple();
 	else if (!strcmp(argv[1], "sizes"))
 		return test_sizes();
-	else if (!strcmp(argv[1], "file")) {
+	else if (!strcmp(argv[1], "reference")) {
+		if (argc < 6) {
+			fprintf(stderr, "usage: test-tool chunker reference MIN TARGET MAX PATH\n");
+			return 1;
+		}
+		return test_reference(argv[2], argv[3], argv[4], argv[5]);
+	} else if (!strcmp(argv[1], "file")) {
 		if (argc < 3) {
 			fprintf(stderr, "usage: test-tool chunker file PATH\n");
 			return 1;

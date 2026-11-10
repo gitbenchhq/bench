@@ -54,11 +54,12 @@ struct worker_state {
 	int chunk_number;              /* Which chunk (0, 1, 2, ...) */
 
 	/* Input: uncompressed chunk data */
-	unsigned char *input_buffer;   /* Allocated to max_chunk_size + STREAMING_BUFFER_SIZE */
-	size_t input_size;             /* Actual chunk size (can exceed max_chunk_size by up to 64KB) */
+	unsigned char *input_buffer;   /* Allocated to max_chunk_size */
+	size_t input_size;             /* Actual chunk size (at most max_chunk_size) */
 
 	/* Output: compressed chunk data + chunk OID */
-	unsigned char *output_buffer;  /* Allocated to compressBound(max_chunk_size + STREAMING_BUFFER_SIZE) */
+	unsigned char *output_buffer;  /* Pack header + compressed chunk */
+	size_t output_capacity;        /* MAX_PACK_OBJECT_HEADER + compressBound(max_chunk_size) */
 	size_t output_size;            /* Size after compression */
 	struct object_id chunk_oid;    /* SHA256 of this chunk (for manifest) */
 
@@ -85,11 +86,11 @@ struct streaming_chunker_threads {
 
 	/* Chunker state */
 	struct chunk_config chunk_config; /* Chunking configuration */
-	uint64_t fingerprint;            /* Rolling hash state for boundary detection */
+	struct cdc_state cdc;            /* Current chunk's length and gear fingerprint */
+	size_t read_size;                /* Bytes per read (STREAMING_BUFFER_SIZE) */
 
 	/* Current chunk being built (by producer) */
 	struct strbuf chunk_buffer;      /* Buffer for current chunk (max max_chunk_size) */
-	size_t current_chunk_size;       /* Size of current chunk */
 
 	/* Content hash (for entire file as if it were one blob) */
 	struct git_hash_ctx content_hash_ctx; /* Hash of "blob <total_size>\0" + entire_file_data */

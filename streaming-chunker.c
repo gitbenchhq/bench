@@ -83,8 +83,8 @@ static int streaming_chunker_init_common(struct streaming_chunker *sc, size_t da
 	strbuf_release(&header);
 
 	sc->total_size = 0;
-	sc->current_chunk_size = 0;
-	sc->fingerprint = 0;
+	sc->cdc = (struct cdc_state)CDC_STATE_INIT;
+	sc->read_size = chunker_read_size(STREAMING_BUFFER_SIZE);
 	sc->error_occurred = 0;
 
 	return 0;
@@ -157,10 +157,8 @@ static int finalize_current_chunk(struct streaming_chunker *sc)
 	sc->chunk_sizes[sc->chunk_count] = sc->chunk_buffer.len;
 	sc->chunk_count++;
 
-	/* Clear buffer and reset for next chunk */
+	/* Clear buffer for the next chunk (cdc_feed resets its own state) */
 	strbuf_reset(&sc->chunk_buffer);
-	sc->current_chunk_size = 0;
-	sc->fingerprint = 0;  /* Reset fingerprint for new chunk */
 
 	return 0;
 }
@@ -171,15 +169,13 @@ int streaming_chunker_process_file(struct streaming_chunker *sc)
 	 * Streaming chunker main loop.
 	 *
 	 * Algorithm:
-	 *   1. Read file in 8KB pages
-	 *   2. Add each page to current chunk buffer
-	 *   3. Update content hash (for entire file)
-	 *   4. Check for content-defined boundaries using Gear hash:
-	 *      - Skip boundary detection until chunk >= min_size (FastCDC optimization)
-	 *      - Once past min_size, scan for boundaries in each page
-	 *      - Force cut at max_size if no boundary found
-	 *   5. When boundary found: finalize chunk, start new one with leftover bytes
-	 *   6. At EOF: finalize remaining chunk
+	 *   1. Read the input in reads of read_size bytes (64 KB)
+	 *   2. Update the content hash (for the entire file)
+	 *   3. Split each read into chunks with cdc_feed() (chunker.h), which
+	 *      holds the cut rule: skip the first min_size bytes, cut on the
+	 *      gear hash, or at exactly max_size. Bytes after a cut start the
+	 *      next chunk and are scanned like any others.
+	 *   4. At EOF: finalize the remaining chunk
 	 *
 	 * Two hashes are computed:
 	 *   - Content hash: hash("blob <total_size>\0" + entire_file_data)
@@ -189,13 +185,13 @@ int streaming_chunker_process_file(struct streaming_chunker *sc)
 	 */
 
 	ssize_t bytes_read;
-	size_t old_chunk_size;
+	size_t pos;
 
 	while (1) {
 		/* Read next page from file or buffer */
 		if (sc->fd >= 0) {
 			/* File mode: read from file descriptor */
-			bytes_read = xread(sc->fd, sc->read_buffer, STREAMING_BUFFER_SIZE);
+			bytes_read = xread(sc->fd, sc->read_buffer, sc->read_size);
 			if (bytes_read < 0) {
 				strbuf_addf(&sc->error_message, "failed to read file: %s",
 				            strerror(errno));
@@ -208,9 +204,9 @@ int streaming_chunker_process_file(struct streaming_chunker *sc)
 			if (remaining == 0) {
 				bytes_read = 0;  /* EOF */
 			} else {
-				bytes_read = remaining < STREAMING_BUFFER_SIZE
+				bytes_read = remaining < sc->read_size
 				           ? remaining
-				           : STREAMING_BUFFER_SIZE;
+				           : sc->read_size;
 				memcpy(sc->read_buffer, sc->buffer + sc->buffer_pos, bytes_read);
 				sc->buffer_pos += bytes_read;
 			}
@@ -225,83 +221,25 @@ int streaming_chunker_process_file(struct streaming_chunker *sc)
 			                         sc->read_buffer, bytes_read);
 		}
 
-		/* Add entire page to current chunk buffer */
-		old_chunk_size = sc->current_chunk_size;
-
-		strbuf_add(&sc->chunk_buffer, sc->read_buffer, bytes_read);
-		sc->current_chunk_size += bytes_read;
 		sc->total_size += bytes_read;
 
 		/*
-		 * Skip boundary detection until we reach minimum chunk size.
-		 * This is FastCDC's "skip sub-minimum cut-point" optimization.
+		 * Split this read into chunks. cdc_feed() says how many bytes
+		 * belong to the current chunk and whether it ends there; the
+		 * rest of the read is fed again, so a cut in the middle of a
+		 * read (content-defined or at exactly max_size) starts the next
+		 * chunk with the remaining bytes, which are scanned as usual.
 		 */
-		if (sc->current_chunk_size < sc->chunk_config.min_size)
-			continue;
+		pos = 0;
+		while (pos < (size_t)bytes_read) {
+			int cut;
+			size_t take = cdc_feed(&sc->chunk_config, &sc->cdc,
+					       sc->read_buffer + pos,
+					       bytes_read - pos, &cut);
 
-		/*
-		 * We're now at or past minimum size. Determine which portion
-		 * of the page to scan for boundaries.
-		 */
-		const unsigned char *scan_start;
-		size_t scan_length;
-		size_t bytes_before_scan;
-
-		if (old_chunk_size < sc->chunk_config.min_size) {
-			/* Just crossed minimum threshold with this page.
-			 * Only scan the portion beyond min_size.
-			 */
-			size_t bytes_to_skip = sc->chunk_config.min_size - old_chunk_size;
-			scan_start = sc->read_buffer + bytes_to_skip;
-			scan_length = bytes_read - bytes_to_skip;
-			bytes_before_scan = sc->chunk_config.min_size;
-		} else {
-			/* Already past minimum before this page.
-			 * Scan the entire page.
-			 */
-			scan_start = sc->read_buffer;
-			scan_length = bytes_read;
-			bytes_before_scan = old_chunk_size;
-		}
-
-		/* Check for content-defined boundaries using Gear hash */
-		if (scan_length > 0) {
-			chunk_boundary_t boundary = find_chunk_boundary(
-				&sc->chunk_config,
-				scan_start,
-				scan_length,
-				&sc->fingerprint);
-
-			if (boundary > 0) {
-				/* Boundary found - finalize current chunk */
-				size_t boundary_offset_in_page = (scan_start - sc->read_buffer) + boundary;
-				size_t chunk_final_size = bytes_before_scan + boundary;
-				size_t leftover_bytes = bytes_read - boundary_offset_in_page;
-
-				/* Trim chunk_buffer to boundary point */
-				strbuf_setlen(&sc->chunk_buffer, chunk_final_size);
-				sc->current_chunk_size = chunk_final_size;
-
-				/* Write chunk to ODB as blob object */
-				if (finalize_current_chunk(sc) < 0)
-					return -1;
-
-				/* Start new chunk with leftover bytes */
-				if (leftover_bytes > 0) {
-					strbuf_add(&sc->chunk_buffer,
-					          sc->read_buffer + boundary_offset_in_page,
-					          leftover_bytes);
-					sc->current_chunk_size = leftover_bytes;
-				}
-
-				continue;
-			}
-		}
-
-		/* No boundary found - check if we've hit max size */
-		if (sc->current_chunk_size >= sc->chunk_config.max_size) {
-			/* Force chunk cut at max_size (safety limit) */
-			if (finalize_current_chunk(sc) < 0)
+			strbuf_add(&sc->chunk_buffer, sc->read_buffer + pos, take);
+			pos += take;
+			if (cut && finalize_current_chunk(sc) < 0)
 				return -1;
 		}
 	}

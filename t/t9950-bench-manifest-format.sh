@@ -320,6 +320,60 @@ test_expect_success 'chunk.targetSize must be a power of two' '
 	)
 '
 
+# --- cut points ------------------------------------------------------------
+
+# Input mixing random data with a long run of zeros (no content-defined
+# cuts there, so chunks are cut at exactly max).
+test_expect_success 'setup cut-point input' '
+	test-tool genrandom cut-a 700000 >cut.bin &&
+	head -c 300000 /dev/zero >>cut.bin &&
+	test-tool genrandom cut-b 500000 >>cut.bin
+'
+
+# check_cuts <min> <target> <max>: for both chunkers and several read
+# sizes, bench cuts cut.bin exactly where the byte-at-a-time reference
+# does, so no chunk exceeds max, every non-last chunk is at least min,
+# and the manifest is the same however the file was read.
+check_cuts () {
+	min=$1 target=$2 max=$3 &&
+	test-tool chunker reference $min $target $max cut.bin >ref &&
+	! awk -v max=$max "\$1 > max" ref | grep . &&
+	sed \$d ref | awk -v min=$min "\$1 < min" >short &&
+	test_must_be_empty short &&
+	for threads in 1 4
+	do
+		for rs in 65536 4093 1000
+		do
+			rm -rf cuts &&
+			bench init -q cuts &&
+			bench -C cuts config chunk.minSize $min &&
+			bench -C cuts config chunk.targetSize $target &&
+			bench -C cuts config chunk.maxSize $max &&
+			bench -C cuts config bench.threads $threads &&
+			cp cut.bin cuts/ &&
+			(cd cuts && GIT_TEST_BENCH_READ_SIZE=$rs bench add cut.bin) &&
+			M=$(bench -C cuts ls-files -s cut.bin | awk "{print \$2}") &&
+			bench -C cuts cat-file -p $M | sed -n "5,\$p" | awk "{print \$2}" >sizes &&
+			test_cmp ref sizes &&
+			echo $M >>manifests || return 1
+		done
+	done &&
+	test "$(sort -u manifests | wc -l)" = 1 &&
+	rm -rf cuts manifests
+}
+
+test_expect_success 'cuts match the reference: min smaller than one read' '
+	check_cuts 4096 8192 32768
+'
+
+test_expect_success 'cuts match the reference: min and max over one read' '
+	check_cuts 70000 65536 200000
+'
+
+test_expect_success 'cuts match the reference: min = max (fixed-size chunks)' '
+	check_cuts 50000 65536 50000
+'
+
 test_expect_success 'fsck: a chunk line whose size is not the chunk size' '
 	T=$(($(S) + 1)) &&
 	printf "1\n%s\n%s\n1\n%s %s\n" $T $(C) $(C) $T >m &&

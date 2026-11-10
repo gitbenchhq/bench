@@ -88,7 +88,13 @@ static void *worker_thread(void *arg)
 		stream.next_in = w->input_buffer;
 		stream.avail_in = w->input_size;
 		stream.next_out = out_ptr;
-		stream.avail_out = bound;
+		/*
+		 * The pack header goes first, so zlib gets only the space left
+		 * after it; if the bound does not fit, deflate stops short and
+		 * the chunk fails cleanly instead of overrunning the buffer.
+		 */
+		stream.avail_out = bound < w->output_capacity - hdrlen
+				   ? bound : w->output_capacity - hdrlen;
 
 		while ((status = git_deflate(&stream, Z_FINISH)) == Z_OK)
 			; /* nothing */
@@ -160,19 +166,15 @@ static int init_workers(struct streaming_chunker_threads *sc)
 	sc->workers = xcalloc(sc->num_workers, sizeof(struct worker_state));
 	max_chunk_size = repo_settings_get_chunk_max_size(the_repository);
 
-	/*
-	 * Input buffer must accommodate max_chunk_size + one read buffer
-	 * because producer reads in STREAMING_BUFFER_SIZE chunks and may exceed
-	 * max_chunk_size before checking the limit.
-	 */
-	input_buffer_size = max_chunk_size + STREAMING_BUFFER_SIZE;
+	/* cdc_feed() never builds a chunk larger than max_chunk_size. */
+	input_buffer_size = max_chunk_size;
 
 	/*
-	 * Output buffer must be sized for the actual max input size,
-	 * not just max_chunk_size. For incompressible data, compressed size
-	 * can be larger than input (zlib overhead).
+	 * Output buffer: the pack object header, then the compressed chunk,
+	 * which for incompressible data is larger than the input (zlib
+	 * overhead, at most compressBound()).
 	 */
-	output_buffer_size = compressBound(input_buffer_size);
+	output_buffer_size = MAX_PACK_OBJECT_HEADER + compressBound(input_buffer_size);
 
 	for (i = 0; i < sc->num_workers; i++) {
 		struct worker_state *w = &sc->workers[i];
@@ -187,6 +189,7 @@ static int init_workers(struct streaming_chunker_threads *sc)
 		/* Allocate buffers */
 		w->input_buffer = xmalloc(input_buffer_size);
 		w->output_buffer = xmalloc(output_buffer_size);
+		w->output_capacity = output_buffer_size;
 
 		if (!w->input_buffer || !w->output_buffer) {
 			strbuf_addf(&sc->error_message,
@@ -330,8 +333,8 @@ static int streaming_chunker_threads_init_common(struct streaming_chunker_thread
 	strbuf_release(&header);
 
 	sc->total_size = 0;
-	sc->current_chunk_size = 0;
-	sc->fingerprint = 0;
+	sc->cdc = (struct cdc_state)CDC_STATE_INIT;
+	sc->read_size = chunker_read_size(STREAMING_BUFFER_SIZE);
 	sc->error_occurred = 0;
 
 	/* Initialize parallel compression state */
@@ -416,6 +419,11 @@ static int dispatch_chunk_to_worker(struct streaming_chunker_threads *sc)
 
 	w = &sc->workers[worker_idx];
 
+	if (sc->chunk_buffer.len > sc->chunk_config.max_size)
+		BUG("chunk of %"PRIuMAX" bytes is over max_size %"PRIuMAX,
+		    (uintmax_t)sc->chunk_buffer.len,
+		    (uintmax_t)sc->chunk_config.max_size);
+
 	/* Copy chunk data to worker's input buffer */
 	pthread_mutex_lock(&w->mutex);
 
@@ -434,10 +442,8 @@ static int dispatch_chunk_to_worker(struct streaming_chunker_threads *sc)
 	pthread_cond_signal(&sc->consumer_cond);
 	pthread_mutex_unlock(&sc->consumer_mutex);
 
-	/* Clear buffer for next chunk */
+	/* Clear buffer for the next chunk (cdc_feed resets its own state) */
 	strbuf_reset(&sc->chunk_buffer);
-	sc->current_chunk_size = 0;
-	sc->fingerprint = 0;  /* Reset fingerprint for new chunk */
 
 	return 0;
 }
@@ -530,7 +536,7 @@ static int consume_next_chunk(struct streaming_chunker_threads *sc)
 static void *producer_thread_func(void *arg)
 {
 	struct streaming_chunker_threads *sc = arg;
-	size_t old_chunk_size;
+	size_t pos;
 
 	/* Producer loop: Read file and create chunks */
 	while (!sc->reading_done) {
@@ -542,7 +548,7 @@ static void *producer_thread_func(void *arg)
 		/* Read next page */
 		if (sc->fd >= 0) {
 			/* File mode */
-			bytes_read = xread(sc->fd, sc->read_buffer, STREAMING_BUFFER_SIZE);
+			bytes_read = xread(sc->fd, sc->read_buffer, sc->read_size);
 			if (bytes_read < 0) {
 				/* error_message belongs to the main thread */
 				sc->producer_read_errno = errno;
@@ -553,9 +559,9 @@ static void *producer_thread_func(void *arg)
 			/* Buffer mode */
 			size_t remaining = sc->buffer_len - sc->buffer_pos;
 			if (remaining > 0) {
-				bytes_read = remaining < STREAMING_BUFFER_SIZE
+				bytes_read = remaining < sc->read_size
 				           ? remaining
-				           : STREAMING_BUFFER_SIZE;
+				           : sc->read_size;
 				memcpy(sc->read_buffer, sc->buffer + sc->buffer_pos, bytes_read);
 				sc->buffer_pos += bytes_read;
 			}
@@ -582,73 +588,23 @@ static void *producer_thread_func(void *arg)
 			                         sc->read_buffer, bytes_read);
 		}
 
-		/* Add entire page to current chunk buffer */
-		old_chunk_size = sc->current_chunk_size;
-
-		strbuf_add(&sc->chunk_buffer, sc->read_buffer, bytes_read);
-		sc->current_chunk_size += bytes_read;
 		sc->total_size += bytes_read;
 
-		/* Skip boundary detection until we reach minimum chunk size */
-		if (sc->current_chunk_size >= sc->chunk_config.min_size) {
-			const unsigned char *scan_start;
-			size_t scan_length;
-			size_t bytes_before_scan;
+		/*
+		 * Split this read into chunks with cdc_feed() (the same cut
+		 * rule as the serial chunker); bytes after a cut start the next
+		 * chunk and are scanned like any others.
+		 */
+		pos = 0;
+		while (pos < (size_t)bytes_read) {
+			int cut;
+			size_t take = cdc_feed(&sc->chunk_config, &sc->cdc,
+					       sc->read_buffer + pos,
+					       bytes_read - pos, &cut);
 
-			if (old_chunk_size < sc->chunk_config.min_size) {
-				/* Just crossed minimum threshold with this page */
-				size_t bytes_to_skip = sc->chunk_config.min_size - old_chunk_size;
-				scan_start = sc->read_buffer + bytes_to_skip;
-				scan_length = bytes_read - bytes_to_skip;
-				bytes_before_scan = sc->chunk_config.min_size;
-			} else {
-				/* Already past minimum - scan entire page */
-				scan_start = sc->read_buffer;
-				scan_length = bytes_read;
-				bytes_before_scan = old_chunk_size;
-			}
-
-			/* Check for content-defined boundaries using Gear hash */
-			if (scan_length > 0) {
-				chunk_boundary_t boundary = find_chunk_boundary(
-					&sc->chunk_config,
-					scan_start,
-					scan_length,
-					&sc->fingerprint);
-
-				if (boundary > 0) {
-					/* Boundary found - dispatch current chunk */
-					size_t boundary_offset_in_page = (scan_start - sc->read_buffer) + boundary;
-					size_t chunk_final_size = bytes_before_scan + boundary;
-					size_t leftover_bytes = bytes_read - boundary_offset_in_page;
-
-					/* Trim chunk_buffer to boundary point */
-					strbuf_setlen(&sc->chunk_buffer, chunk_final_size);
-					sc->current_chunk_size = chunk_final_size;
-
-					/* Dispatch chunk to worker */
-					if (dispatch_chunk_to_worker(sc) < 0) {
-						sc->producer_error = 1;
-						return producer_exit(sc);
-					}
-
-					/* Start new chunk with leftover bytes */
-					if (leftover_bytes > 0) {
-						strbuf_add(&sc->chunk_buffer,
-						          sc->read_buffer + boundary_offset_in_page,
-						          leftover_bytes);
-						sc->current_chunk_size = leftover_bytes;
-					}
-
-					continue;
-				}
-			}
-		}
-
-		/* No boundary found - check if we've hit max size */
-		if (sc->current_chunk_size >= sc->chunk_config.max_size) {
-			/* Force chunk cut at max_size (safety limit) */
-			if (dispatch_chunk_to_worker(sc) < 0) {
+			strbuf_add(&sc->chunk_buffer, sc->read_buffer + pos, take);
+			pos += take;
+			if (cut && dispatch_chunk_to_worker(sc) < 0) {
 				sc->producer_error = 1;
 				return producer_exit(sc);
 			}

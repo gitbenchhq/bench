@@ -84,7 +84,7 @@ void init_chunk_config_custom(struct chunk_config *cfg, int target_bits);
  * Find the next chunk boundary in a data stream
  *
  * This function scans the input buffer using Gear hash to find content-defined
- * boundaries. The caller is responsible for min/max size enforcement and EOF handling.
+ * boundaries. It knows nothing about min/max size or EOF.
  *
  * @param cfg Chunking configuration (mask is used for boundary detection)
  * @param data Input data buffer
@@ -96,35 +96,9 @@ void init_chunk_config_custom(struct chunk_config *cfg, int target_bits);
  *            0 = empty buffer
  *           >0 = boundary found at this offset (chunk contains 'offset' bytes)
  *
- * Usage pattern:
- *   uint64_t fp = 0;
- *   size_t current_chunk_size = 0;
- *
- *   while (reading_file) {
- *     ssize_t nread = read(fd, buffer, sizeof(buffer));
- *     if (nread <= 0) break;  // EOF or error
- *
- *     chunk_boundary_t boundary = find_chunk_boundary(&cfg, buffer, nread, &fp);
- *
- *     if (boundary < 0) {
- *       // No boundary found, accumulate
- *       current_chunk_size += nread;
- *       if (current_chunk_size >= cfg.max_size) {
- *         // Force cut at max_size
- *       }
- *     } else if (boundary > 0) {
- *       // Boundary found
- *       current_chunk_size += boundary;
- *       if (current_chunk_size >= cfg.min_size) {
- *         // Accept boundary, create chunk
- *       }
- *     }
- *   }
- *
- *   // Handle final chunk at EOF
- *   if (current_chunk_size > 0) {
- *     // Create final chunk
- *   }
+ * This is the hash scan only. Chunkers must not call it directly: use
+ * cdc_feed() below, which applies min_size, max_size and the fingerprint
+ * reset around it so every chunker cuts at the same places.
  */
 chunk_boundary_t find_chunk_boundary(const struct chunk_config *cfg,
 				     const unsigned char *data,
@@ -141,6 +115,42 @@ chunk_boundary_t find_chunk_boundary(const struct chunk_config *cfg,
  * is reproducible across different runs and machines.
  */
 void init_gear_table(void);
+
+/*
+ * The cut rule, in one place, for every chunker. One chunk is being built;
+ * cdc_state holds its length so far and its gear fingerprint.
+ *
+ * cdc_feed() takes the next n bytes of the input and returns how many of
+ * them belong to the current chunk (at least 1 when n > 0). If the chunk
+ * ends right after those bytes it sets *cut and resets the state for the
+ * next chunk. The caller appends the returned bytes to its chunk, emits
+ * the chunk when *cut is set, and calls again with the remaining bytes.
+ *
+ * The rule:
+ *   - the first min_size bytes of a chunk are not hashed;
+ *   - after that, fp = (fp << 1) + gear[byte], and the chunk ends after
+ *     the first byte where (fp & mask) == 0;
+ *   - otherwise it ends at exactly max_size bytes;
+ *   - fp starts at 0 for every chunk.
+ * Cut points depend only on the bytes, never on how the input was split
+ * into calls, so any read size gives the same chunks.
+ */
+struct cdc_state {
+	size_t len;
+	uint64_t fp;
+};
+
+#define CDC_STATE_INIT { 0, 0 }
+
+size_t cdc_feed(const struct chunk_config *cfg, struct cdc_state *st,
+		const unsigned char *buf, size_t n, int *cut);
+
+/*
+ * Bytes per read for the streaming chunkers: buf_size, or for tests the
+ * value of GIT_TEST_BENCH_READ_SIZE (clamped to 1..buf_size), so the
+ * test suite can check that cut points do not depend on the read size.
+ */
+size_t chunker_read_size(size_t buf_size);
 
 /*
  * A file's size and modification time, taken before chunking it, so the
