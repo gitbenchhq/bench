@@ -103,7 +103,7 @@ const char *test_file = "../../test-data/test-1.5gb.bin";
 Shell test scripts reference them:
 
 ```bash
-# From t/t9100-bench-demo.sh
+# From t/t9952-bench-vs-git-demo.sh
 TEST_FILE="$TEST_DIRECTORY/test-data/sars-cov2.fastq"
 ```
 

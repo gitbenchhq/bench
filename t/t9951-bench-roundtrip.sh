@@ -38,7 +38,7 @@ make_inputs () {
 	done &&
 	for n in $((max + 1)) $((3 * max)) 1000000
 	do
-		head -c $n /dev/zero >"$dir/zero-$n.bin" || return 1
+		test-tool genzeros $n >"$dir/zero-$n.bin" || return 1
 	done &&
 	test-tool genrandom big 1500000 >"$dir/sub dir/big file.bin" &&
 	cp "$dir/rand-65537.bin" "$dir/run.sh" &&

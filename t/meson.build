@@ -1096,6 +1096,9 @@ integration_tests = [
   't9901-git-web--browse.sh',
   't9902-completion.sh',
   't9903-bash-prompt.sh',
+  't9950-bench-manifest-format.sh',
+  't9951-bench-roundtrip.sh',
+  't9952-bench-vs-git-demo.sh',
 ]
 
 benchmarks = [

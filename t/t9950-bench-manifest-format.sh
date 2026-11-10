@@ -326,7 +326,7 @@ test_expect_success 'chunk.targetSize must be a power of two' '
 # cuts there, so chunks are cut at exactly max).
 test_expect_success 'setup cut-point input' '
 	test-tool genrandom cut-a 700000 >cut.bin &&
-	head -c 300000 /dev/zero >>cut.bin &&
+	test-tool genzeros 300000 >>cut.bin &&
 	test-tool genrandom cut-b 500000 >>cut.bin
 '
 
@@ -358,7 +358,8 @@ check_cuts () {
 			echo $M >>manifests || return 1
 		done
 	done &&
-	test "$(sort -u manifests | wc -l)" = 1 &&
+	sort -u manifests >uniq &&
+	test_line_count = 1 uniq &&
 	rm -rf cuts manifests
 }
 
