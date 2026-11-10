@@ -250,6 +250,18 @@ static void prepare_to_stream(struct bulk_checkin_packfile *state,
 		die_errno("unable to write pack header");
 }
 
+/*
+ * Free the hash state that hashfile_checkpoint_init() allocated: some hash
+ * backends (OpenSSL) allocate a context there that nothing else frees,
+ * which would leak once per object, so once per chunk of a large file.
+ */
+static void release_checkpoint(struct hashfile_checkpoint *checkpoint)
+{
+	unsigned char discard[GIT_MAX_RAWSZ];
+
+	git_hash_final(discard, &checkpoint->ctx);
+}
+
 static int deflate_blob_to_pack(struct bulk_checkin_packfile *state,
 				struct object_id *result_oid,
 				int fd, size_t size,
@@ -301,8 +313,14 @@ static int deflate_blob_to_pack(struct bulk_checkin_packfile *state,
 		hashfile_truncate(state->f, &checkpoint);
 		state->offset = checkpoint.offset;
 		flush_bulk_checkin_packfile(state);
-		if (lseek(fd, seekback, SEEK_SET) == (off_t) -1)
+		if (lseek(fd, seekback, SEEK_SET) == (off_t) -1) {
+			unsigned char discard[GIT_MAX_RAWSZ];
+
+			git_hash_final(discard, &ctx);
+			release_checkpoint(&checkpoint);
+			free(idx);
 			return error("cannot seek back");
+		}
 	}
 	git_hash_final_oid(result_oid, &ctx);
 	if (!idx)
@@ -320,6 +338,7 @@ static int deflate_blob_to_pack(struct bulk_checkin_packfile *state,
 			   state->alloc_written);
 		state->written[state->nr_written++] = idx;
 	}
+	release_checkpoint(&checkpoint);
 	return 0;
 }
 
@@ -456,12 +475,18 @@ static int deflate_buffer_to_pack(struct bulk_checkin_packfile *state,
 
 	header_len = format_object_header((char *)header, sizeof(header),
 					  OBJ_BLOB, size);
-	the_hash_algo->init_fn(&ctx);
-	git_hash_update(&ctx, header, header_len);
 
-	/* Note: idx is non-NULL when we are writing */
-	if ((flags & INDEX_WRITE_OBJECT) != 0)
+	/*
+	 * Note: idx is non-NULL when we are writing. The checkpoint's hash
+	 * context must be initialized before hashfile_checkpoint() copies
+	 * into it (some hash backends crash on an uninitialized one).
+	 */
+	if ((flags & INDEX_WRITE_OBJECT) != 0) {
 		CALLOC_ARRAY(idx, 1);
+
+		prepare_to_stream(state, flags);
+		hashfile_checkpoint_init(state->f, &checkpoint);
+	}
 
 	while (1) {
 		prepare_to_stream(state, flags);
@@ -471,12 +496,21 @@ static int deflate_buffer_to_pack(struct bulk_checkin_packfile *state,
 			crc32_begin(state->f);
 		}
 
-		/* Reset hash context for retry - need to re-hash the header */
+		/*
+		 * Hash the object from the start on every attempt. Only one
+		 * context is live at a time: a retry finishes the previous
+		 * one first, since some hash backends allocate in init.
+		 */
 		the_hash_algo->init_fn(&ctx);
 		git_hash_update(&ctx, header, header_len);
 
 		if (!stream_buffer_to_pack(state, &ctx, buf, size, flags))
 			break;
+		{
+			unsigned char discard[GIT_MAX_RAWSZ];
+
+			git_hash_final(discard, &ctx);
+		}
 
 		/*
 		 * Writing this object to the current pack will make
@@ -506,6 +540,7 @@ static int deflate_buffer_to_pack(struct bulk_checkin_packfile *state,
 			   state->alloc_written);
 		state->written[state->nr_written++] = idx;
 	}
+	release_checkpoint(&checkpoint);
 	return 0;
 }
 
@@ -524,9 +559,13 @@ static int write_precompressed_to_pack(struct bulk_checkin_packfile *state,
 	struct hashfile_checkpoint checkpoint;
 	struct pack_idx_entry *idx = NULL;
 
-	/* Note: idx is non-NULL when we are writing */
-	if ((flags & INDEX_WRITE_OBJECT) != 0)
+	/* Note: idx is non-NULL when we are writing (see above) */
+	if ((flags & INDEX_WRITE_OBJECT) != 0) {
 		CALLOC_ARRAY(idx, 1);
+
+		prepare_to_stream(state, flags);
+		hashfile_checkpoint_init(state->f, &checkpoint);
+	}
 
 	while (1) {
 		prepare_to_stream(state, flags);
@@ -575,6 +614,7 @@ static int write_precompressed_to_pack(struct bulk_checkin_packfile *state,
 			   state->alloc_written);
 		state->written[state->nr_written++] = idx;
 	}
+	release_checkpoint(&checkpoint);
 	return 0;
 }
 

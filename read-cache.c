@@ -837,18 +837,16 @@ int add_to_index(struct index_state *istate, const char *path, struct stat *st, 
 		}
 		
 		/*
-		 * If index_path() created a manifest object in a Bench repository,
-		 * update the cache entry mode to reflect this.
+		 * In a bench repository index_path() stores every regular file
+		 * as a manifest, so its entry takes the manifest mode. Do not
+		 * look the object up to find out: with hash-only flags (add
+		 * --dry-run) it was never stored, and a miss could even try to
+		 * fetch it from a promisor remote.
 		 */
 		if (S_ISREG(ce->ce_mode)) {
 			struct repository *repo = istate && istate->repo ? istate->repo : the_repository;
-			if (repo_has_bench_extensions(repo)) {
-				enum object_type obj_type = oid_object_info(repo, &ce->oid, NULL);
-				if (obj_type == OBJ_MANIFEST) {
-					/* Update cache entry to use manifest mode */
-					ce->ce_mode = S_IFMANIFEST | (ce->ce_mode & 0777);
-				}
-			}
+			if (repo_has_bench_extensions(repo))
+				ce->ce_mode = S_IFMANIFEST | (ce->ce_mode & 0777);
 		}
 	} else
 		set_object_name_for_intent_to_add_entry(ce);

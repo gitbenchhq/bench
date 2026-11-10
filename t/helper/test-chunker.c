@@ -2,11 +2,15 @@
  * test-chunker.c: test harness for content-defined chunking
  */
 
+#define USE_THE_REPOSITORY_VARIABLE
+
 #include "test-tool.h"
 #include "git-compat-util.h"
 #include "chunker.h"
 #include "strbuf.h"
 #include "parse-options.h"
+#include "repository.h"
+#include "setup.h"
 
 /*
  * Test the chunker with a simple repeating pattern
@@ -23,8 +27,9 @@ static int test_simple(void)
 	unsigned char data[1024 * 1024];  /* 1MB buffer */
 	size_t i;
 
-	/* Initialize with default config (2MB min, 16MB target, 64MB max) */
-	init_chunk_config(&cfg);
+	/* The default config (2MB min, 16MB target, 64MB max) */
+	chunk_config_init(&cfg, CHUNK_MIN_SIZE_DEFAULT, CHUNK_TARGET_SIZE_DEFAULT,
+			  CHUNK_MAX_SIZE_DEFAULT);
 	printf("Chunk config: min=%zu max=%zu mask=0x%llx\n",
 	       cfg.min_size, cfg.max_size, (unsigned long long)cfg.mask);
 
@@ -57,7 +62,8 @@ static int test_sizes(void)
 	size_t i;
 
 	for (i = 0; i < ARRAY_SIZE(target_bits); i++) {
-		init_chunk_config_custom(&cfg, target_bits[i]);
+		chunk_config_init(&cfg, 0, 1UL << target_bits[i],
+				  CHUNK_MAX_SIZE_LIMIT);
 		printf("Target bits=%d → avg chunk size=%.1fMB (mask=0x%llx)\n",
 		       target_bits[i],
 		       (1ULL << target_bits[i]) / (1024.0 * 1024.0),
@@ -89,7 +95,8 @@ static int test_file(const char *filename)
 		return 1;
 	}
 
-	init_chunk_config(&cfg);
+	chunk_config_init(&cfg, CHUNK_MIN_SIZE_DEFAULT, CHUNK_TARGET_SIZE_DEFAULT,
+			  CHUNK_MAX_SIZE_DEFAULT);
 	printf("Chunking file: %s\n", filename);
 	while ((nread = read(fd, buffer, sizeof(buffer))) > 0) {
 		size_t pos = 0;
@@ -137,7 +144,8 @@ static int test_reference(const char *min_s, const char *target_s,
 		target >>= 1;
 		bits++;
 	}
-	init_chunk_config(&cfg);
+	/* Set directly: the reference shares no code with chunk_config_init. */
+	memset(&cfg, 0, sizeof(cfg));
 	cfg.min_size = min;
 	cfg.max_size = max;
 	cfg.mask = (1ULL << bits) - 1;
@@ -164,10 +172,26 @@ static int test_reference(const char *min_s, const char *target_s,
 	return 0;
 }
 
+/*
+ * Print the checked chunk configuration of the repository in the current
+ * directory, as the chunkers see it: "min max mask". Dies, like bench add,
+ * if the configuration is invalid.
+ */
+static int test_repo_config(void)
+{
+	struct chunk_config cfg;
+
+	setup_git_directory();
+	chunk_config_from_repo(the_repository, &cfg);
+	printf("%"PRIuMAX" %"PRIuMAX" %"PRIuMAX"\n", (uintmax_t)cfg.min_size,
+	       (uintmax_t)cfg.max_size, (uintmax_t)cfg.mask);
+	return 0;
+}
+
 int cmd__chunker(int argc, const char **argv)
 {
 	if (argc < 2) {
-		fprintf(stderr, "usage: test-tool chunker <test|sizes|file PATH|reference MIN TARGET MAX PATH>\n");
+		fprintf(stderr, "usage: test-tool chunker <test|sizes|repo-config|file PATH|reference MIN TARGET MAX PATH>\n");
 		return 1;
 	}
 
@@ -175,6 +199,8 @@ int cmd__chunker(int argc, const char **argv)
 		return test_simple();
 	else if (!strcmp(argv[1], "sizes"))
 		return test_sizes();
+	else if (!strcmp(argv[1], "repo-config"))
+		return test_repo_config();
 	else if (!strcmp(argv[1], "reference")) {
 		if (argc < 6) {
 			fprintf(stderr, "usage: test-tool chunker reference MIN TARGET MAX PATH\n");

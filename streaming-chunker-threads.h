@@ -130,6 +130,7 @@ struct streaming_chunker_threads {
 
 	/* Error handling */
 	int error_occurred;              /* Set to 1 on error */
+	int write_objects;               /* 0: only compute ids (add --dry-run, diff) */
 	struct strbuf error_message;     /* Detailed error message */
 };
 

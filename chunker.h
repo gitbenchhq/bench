@@ -17,42 +17,32 @@
  *   3. Check if (fp & mask) == 0 → boundary found
  *   4. Force cut at max_size if no boundary found
  *
- * The mask determines average chunk size:
- *   mask with N trailing 1 bits → avg chunk size = 2^N bytes
- *   Example: mask = 0xFFFFFF (24 bits) → avg 16MB chunks
+ * The mask sets how far past min_size a cut lands on average:
+ *   mask with N trailing 1 bits (chunk.targetSize = 2^N) → a cut about
+ *   2^N bytes after min_size, so chunks average about min + target.
  */
 
 /* Chunk size configuration */
 struct chunk_config {
-	size_t min_size;  /* Minimum chunk size (e.g., 4MB) */
-	size_t max_size;  /* Maximum chunk size (e.g., 128MB) */
+	size_t min_size;  /* Bytes of each chunk that are never hashed */
+	size_t max_size;  /* No chunk is larger */
 	uint64_t mask;    /* Bit mask for boundary detection */
 };
 
 /*
- * Default chunk size parameters
- *
- * These are fallback values used when repo settings are not available.
- * Normally, chunk sizes should be read from repository configuration via
- * repo_settings_get_chunk_*_size() functions (see repo-settings.h).
- *
- * Defaults optimized for genomics files (50-200 GB typical):
- *   - min: 2 MB (prevents excessive fragmentation)
- *   - target: 16 MB (optimal for large files, manageable manifests)
- *   - max: 64 MB (reasonable upper bound, memory-safe)
- *
- * Users can configure via:
- *   bench config chunk.minSize 4m
- *   bench config chunk.targetSize 32m
- *   bench config chunk.maxSize 128m
+ * Default chunk sizes: the only place they are defined. repo-settings.c
+ * uses them for unset chunk.minSize / chunk.targetSize / chunk.maxSize.
  */
-#define CHUNK_MIN_SIZE_DEFAULT  (2 * 1024 * 1024)      /* 2MB */
-#define CHUNK_TARGET_SIZE_DEFAULT (16 * 1024 * 1024)   /* 16MB */
-#define CHUNK_MAX_SIZE_DEFAULT  (64 * 1024 * 1024)     /* 64MB */
+#define CHUNK_MIN_SIZE_DEFAULT    (2 * 1024 * 1024)    /* 2 MB */
+#define CHUNK_TARGET_SIZE_DEFAULT (16 * 1024 * 1024)   /* 16 MB */
+#define CHUNK_MAX_SIZE_DEFAULT    (64 * 1024 * 1024)   /* 64 MB */
 
-/* Mask calculation: for target size 2^N, mask = (1 << N) - 1 */
-#define CHUNK_MASK_BITS_DEFAULT 24  /* 2^24 = 16MB average */
-#define CHUNK_MASK_DEFAULT ((1ULL << CHUNK_MASK_BITS_DEFAULT) - 1)
+/*
+ * Largest chunk.maxSize allowed. Each chunk is held in memory while it is
+ * hashed and compressed (twice per worker in the threaded chunker), so
+ * this bounds the memory one add can need.
+ */
+#define CHUNK_MAX_SIZE_LIMIT      (1024 * 1024 * 1024) /* 1 GB */
 
 /*
  * Chunk boundary result
@@ -66,19 +56,22 @@ struct chunk_config {
  */
 typedef ssize_t chunk_boundary_t;
 
-/**
- * Initialize chunker configuration with default values
+/*
+ * Fill cfg from min, target and max, or die with a message naming the
+ * setting at fault: target must be a power of two of at least 2, and
+ * min <= target <= max <= CHUNK_MAX_SIZE_LIMIT.
  */
-void init_chunk_config(struct chunk_config *cfg);
+void chunk_config_init(struct chunk_config *cfg, unsigned long min,
+		       unsigned long target, unsigned long max);
 
-/**
- * Initialize chunker configuration with custom target size
- *
- * @param cfg Configuration struct to initialize
- * @param target_bits Number of bits for mask (avg chunk size = 2^target_bits)
- *                    Example: 24 → 16MB avg, 26 → 64MB avg
+struct repository;
+
+/*
+ * Fill cfg from the repository's chunk.minSize, chunk.targetSize and
+ * chunk.maxSize (defaults above), checked as in chunk_config_init().
+ * Every chunker reads its configuration through this function.
  */
-void init_chunk_config_custom(struct chunk_config *cfg, int target_bits);
+void chunk_config_from_repo(struct repository *r, struct chunk_config *cfg);
 
 /**
  * Find the next chunk boundary in a data stream

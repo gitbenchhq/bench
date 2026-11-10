@@ -6,6 +6,7 @@
 #include "midx.h"
 #include "pack-objects.h"
 #include "setup.h"
+#include "chunker.h"
 
 static void repo_cfg_bool(struct repository *r, const char *key, int *dest,
 			  int def)
@@ -176,59 +177,30 @@ void repo_settings_set_big_file_threshold(struct repository *repo, unsigned long
 }
 
 /*
- * Content-defined chunking configuration
- *
- * These settings control how large files are split into chunks:
- *   - chunk.minSize: Minimum chunk size (files < min stay as loose objects)
- *   - chunk.targetSize: Target average chunk size (controls boundary frequency)
- *   - chunk.maxSize: Maximum chunk size (enables deduplication flexibility)
- *
- * Defaults optimized through empirical testing:
- *   - min: 2 MB (preserves loose objects for small files, Git-compatible)
- *   - target: 8 MB (fine granularity for optimal deduplication)
- *   - max: 256 MB (flexible upper bound)
- *
- * Users can configure via:
- *   bench config chunk.minSize 4m
- *   bench config chunk.targetSize 16m
- *   bench config chunk.maxSize 512m
+ * Content-defined chunking configuration:
+ *   - chunk.minSize: the first minSize bytes of a chunk are never cut, and
+ *     files up to minSize are stored as one chunk
+ *   - chunk.targetSize: a power of two; a cut lands about targetSize bytes
+ *     after minSize on average
+ *   - chunk.maxSize: no chunk is larger
+ * Defaults (CHUNK_*_DEFAULT in chunker.h): 2 MB / 16 MB / 64 MB. The values
+ * are checked together by chunk_config_init() (chunker.c), not here.
  */
 
 unsigned long repo_settings_get_chunk_min_size(struct repository *repo)
 {
 	if (!repo->settings.chunk_min_size)
 		repo_cfg_ulong(repo, "chunk.minsize",
-			       &repo->settings.chunk_min_size, 2 * 1024 * 1024);
+			       &repo->settings.chunk_min_size, CHUNK_MIN_SIZE_DEFAULT);
 	return repo->settings.chunk_min_size;
 }
 
-/*
- * The chunker cuts where the low N bits of the gear hash are zero, so the
- * target is 2^N. Any other
- * value would be silently rounded down to a power of two, so two
- * "different" settings would chunk identically and neither would mean
- * what it says: refuse it instead. 1 (= 2^0, a zero-bit mask) is refused
- * too.
- */
 unsigned long repo_settings_get_chunk_target_size(struct repository *repo)
 {
-	if (!repo->settings.chunk_target_size) {
-		unsigned long v;
-
-		repo_cfg_ulong(repo, "chunk.targetsize", &v, 8 * 1024 * 1024);
-		if (v < 2 || (v & (v - 1))) {
-			unsigned long lower = 1;
-
-			while (lower <= v / 2)
-				lower <<= 1;
-			if (v < 2)
-				die(_("chunk.targetSize is %lu; it must be a power of two "
-				      "of at least 2 (for example 16m)"), v);
-			die(_("chunk.targetSize is %lu, which is not a power of two; "
-			      "use %lu or %lu"), v, lower, lower << 1);
-		}
-		repo->settings.chunk_target_size = v;
-	}
+	if (!repo->settings.chunk_target_size)
+		repo_cfg_ulong(repo, "chunk.targetsize",
+			       &repo->settings.chunk_target_size,
+			       CHUNK_TARGET_SIZE_DEFAULT);
 	return repo->settings.chunk_target_size;
 }
 
@@ -236,7 +208,7 @@ unsigned long repo_settings_get_chunk_max_size(struct repository *repo)
 {
 	if (!repo->settings.chunk_max_size)
 		repo_cfg_ulong(repo, "chunk.maxsize",
-			       &repo->settings.chunk_max_size, 256 * 1024 * 1024);
+			       &repo->settings.chunk_max_size, CHUNK_MAX_SIZE_DEFAULT);
 	return repo->settings.chunk_max_size;
 }
 
@@ -417,7 +389,13 @@ static int calculate_optimal_threads(struct repository *repo)
 	 * Previously, dividing by (1024 * 1024) first would truncate chunk sizes
 	 * smaller than 1MB to zero, causing division by zero.
 	 */
-	max_chunk_size = repo_settings_get_chunk_max_size(repo);
+	{
+		/* Checked config: maxSize is at least 2, never 0. */
+		struct chunk_config cfg;
+
+		chunk_config_from_repo(repo, &cfg);
+		max_chunk_size = cfg.max_size;
+	}
 	memory_limit_bytes = memory_limit_mb * 1024UL * 1024UL;
 
 	/* RAM constraint: each worker needs 2x max_chunk_size (input + output) */

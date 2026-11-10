@@ -21,14 +21,15 @@ int should_chunk_file(off_t file_size)
 	 */
 
 	/*
-	 * Use chunk.minSize as the threshold for when to start chunking.
-	 * Files smaller than or equal to this will be stored as single-chunk manifests.
-	 * Files larger than this will be chunked using content-defined chunking.
-	 * Default is 2MB (see repo-settings.c).
+	 * Files up to chunk.minSize are stored as one chunk; larger files
+	 * are chunked. Reading the checked config here means an invalid
+	 * chunk configuration stops every add, before any file is read,
+	 * not only adds of files large enough to chunk.
 	 */
-	unsigned long threshold = repo_settings_get_chunk_min_size(the_repository);
+	struct chunk_config cfg;
 
-	return file_size > threshold;
+	chunk_config_from_repo(the_repository, &cfg);
+	return file_size > 0 && (size_t)file_size > cfg.min_size;
 }
 
 /*
@@ -36,25 +37,8 @@ int should_chunk_file(off_t file_size)
  */
 static int streaming_chunker_init_common(struct streaming_chunker *sc, size_t data_size)
 {
-	/*
-	 * Initialize chunk configuration from repository settings.
-	 * This reads from config values:
-	 *   - chunk.minSize (default: 2MB)
-	 *   - chunk.targetSize (default: 16MB)
-	 *   - chunk.maxSize (default: 64MB)
-	 */
-	sc->chunk_config.min_size = repo_settings_get_chunk_min_size(the_repository);
-	sc->chunk_config.max_size = repo_settings_get_chunk_max_size(the_repository);
-
-	/* Compute mask from target size (for Gear hash boundary detection) */
-	unsigned long target_size = repo_settings_get_chunk_target_size(the_repository);
-	int bits = 0;
-	size_t test = target_size;
-	while (test > 1) {
-		test >>= 1;
-		bits++;
-	}
-	sc->chunk_config.mask = bits > 0 ? (1ULL << bits) - 1 : CHUNK_MASK_DEFAULT;
+	/* chunk.minSize / targetSize / maxSize, checked (chunker.h) */
+	chunk_config_from_repo(the_repository, &sc->chunk_config);
 
 	/* Initialize arrays */
 	sc->chunk_capacity = 16;  /* Start small, grow as needed */
@@ -86,6 +70,7 @@ static int streaming_chunker_init_common(struct streaming_chunker *sc, size_t da
 	sc->cdc = (struct cdc_state)CDC_STATE_INIT;
 	sc->read_size = chunker_read_size(STREAMING_BUFFER_SIZE);
 	sc->error_occurred = 0;
+	sc->write_objects = 1;
 
 	return 0;
 }
@@ -135,11 +120,16 @@ static int finalize_current_chunk(struct streaming_chunker *sc)
 		return -1;
 	}
 
-	/* Write chunk as a blob object using bulk checkin for performance.
-	 * This packs all chunks together instead of creating loose objects. */
-	if (index_buffer_bulk_checkin(&chunk_oid, sc->chunk_buffer.buf,
-	                               sc->chunk_buffer.len,
-	                               INDEX_WRITE_OBJECT) < 0) {
+	/*
+	 * Write the chunk as a blob, packed with the others by bulk checkin,
+	 * or, when only computing ids (add --dry-run, diff), just hash it.
+	 */
+	if (!sc->write_objects) {
+		hash_object_file(the_hash_algo, sc->chunk_buffer.buf,
+				 sc->chunk_buffer.len, OBJ_BLOB, &chunk_oid);
+	} else if (index_buffer_bulk_checkin(&chunk_oid, sc->chunk_buffer.buf,
+					     sc->chunk_buffer.len,
+					     INDEX_WRITE_OBJECT) < 0) {
 		strbuf_addf(&sc->error_message, "failed to write chunk %zu to ODB",
 		            sc->chunk_count);
 		sc->error_occurred = 1;
@@ -309,10 +299,10 @@ int streaming_chunker_finalize(struct streaming_chunker *sc,
 		return -1;
 	}
 
-	/* Create manifest object */
-	if (write_manifest_object(the_repository, manifest_oid, sc->total_size,
-	                          content_oid, sc->chunk_count,
-	                          sc->chunk_oids, sc->chunk_sizes) < 0) {
+	/* Create the manifest object, or only compute its id */
+	if ((sc->write_objects ? write_manifest_object : hash_manifest_object)(
+		    the_repository, manifest_oid, sc->total_size, content_oid,
+		    sc->chunk_count, sc->chunk_oids, sc->chunk_sizes) < 0) {
 		strbuf_addstr(&sc->error_message, "failed to create manifest object");
 		sc->error_occurred = 1;
 		return -1;

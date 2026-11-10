@@ -135,7 +135,16 @@ void *read_blob_entry(const struct cache_entry *ce, size_t *size)
 				      ce->name, header.total_size, MAX_SYMLINK_TARGET);
 				return NULL;
 			}
-			return read_manifest_content(the_repository, &ce->oid, size);
+			{
+				/* size is a size_t; the reader takes an unsigned long */
+				unsigned long content_size;
+				void *content = read_manifest_content(the_repository,
+								      &ce->oid,
+								      &content_size);
+
+				*size = content_size;
+				return content;
+			}
 		}
 		free(blob_data);
 	}

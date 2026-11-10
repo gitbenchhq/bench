@@ -47,6 +47,7 @@
 static void *worker_thread(void *arg)
 {
 	struct worker_state *w = (struct worker_state *)arg;
+	int compress;
 
 	while (1) {
 		pthread_mutex_lock(&w->mutex);
@@ -62,7 +63,14 @@ static void *worker_thread(void *arg)
 			break;
 		}
 
-		/* We have work (status == WORKING) */
+		/*
+		 * We have work (status == WORKING). Read write_objects here,
+		 * under the mutex the chunk was handed over with: it is set
+		 * before the first chunk is dispatched and never changes.
+		 * When only computing ids (add --dry-run, diff) nothing is
+		 * stored, so the chunk is hashed but not compressed.
+		 */
+		compress = w->parent->write_objects;
 		pthread_mutex_unlock(&w->mutex);
 
 		/*
@@ -79,27 +87,30 @@ static void *worker_thread(void *arg)
 		git_zstream stream;
 		unsigned char *out_ptr = w->output_buffer + hdrlen;
 		size_t out_size = 0;
-		int status;
+		int status = Z_STREAM_END;
 		unsigned long bound;
 
-		git_deflate_init(&stream, pack_compression_level);
-		bound = git_deflate_bound(&stream, w->input_size);
+		if (compress) {
+			git_deflate_init(&stream, pack_compression_level);
+			bound = git_deflate_bound(&stream, w->input_size);
 
-		stream.next_in = w->input_buffer;
-		stream.avail_in = w->input_size;
-		stream.next_out = out_ptr;
-		/*
-		 * The pack header goes first, so zlib gets only the space left
-		 * after it; if the bound does not fit, deflate stops short and
-		 * the chunk fails cleanly instead of overrunning the buffer.
-		 */
-		stream.avail_out = bound < w->output_capacity - hdrlen
-				   ? bound : w->output_capacity - hdrlen;
+			stream.next_in = w->input_buffer;
+			stream.avail_in = w->input_size;
+			stream.next_out = out_ptr;
+			/*
+			 * The pack header goes first, so zlib gets only the
+			 * space left after it; if the bound does not fit,
+			 * deflate stops short and the chunk fails cleanly
+			 * instead of overrunning the buffer.
+			 */
+			stream.avail_out = bound < w->output_capacity - hdrlen
+					   ? bound : w->output_capacity - hdrlen;
 
-		while ((status = git_deflate(&stream, Z_FINISH)) == Z_OK)
-			; /* nothing */
+			while ((status = git_deflate(&stream, Z_FINISH)) == Z_OK)
+				; /* nothing */
 
-		git_deflate_end(&stream);
+			git_deflate_end(&stream);
+		}
 
 		/* Compute results before acquiring mutex */
 		int error = 0;
@@ -110,10 +121,12 @@ static void *worker_thread(void *arg)
 			error = 1;
 			output_size_result = 0;
 		} else {
-			out_size = stream.total_out;
-			/* Copy pack header to beginning of output buffer */
-			memcpy(w->output_buffer, pack_header, hdrlen);
-			output_size_result = hdrlen + out_size;
+			if (compress) {
+				out_size = stream.total_out;
+				/* Copy pack header to beginning of output buffer */
+				memcpy(w->output_buffer, pack_header, hdrlen);
+				output_size_result = hdrlen + out_size;
+			}
 
 			/* Compute SHA256 of this chunk for manifest */
 			struct strbuf chunk_header = STRBUF_INIT;
@@ -164,7 +177,7 @@ static int init_workers(struct streaming_chunker_threads *sc)
 		sc->num_workers = 1;
 
 	sc->workers = xcalloc(sc->num_workers, sizeof(struct worker_state));
-	max_chunk_size = repo_settings_get_chunk_max_size(the_repository);
+	max_chunk_size = sc->chunk_config.max_size; /* set by init_common */
 
 	/* cdc_feed() never builds a chunk larger than max_chunk_size. */
 	input_buffer_size = max_chunk_size;
@@ -292,19 +305,8 @@ static int find_worker_with_chunk(struct streaming_chunker_threads *sc, int chun
  */
 static int streaming_chunker_threads_init_common(struct streaming_chunker_threads *sc, size_t data_size)
 {
-	/* Initialize chunk configuration from repository settings */
-	sc->chunk_config.min_size = repo_settings_get_chunk_min_size(the_repository);
-	sc->chunk_config.max_size = repo_settings_get_chunk_max_size(the_repository);
-
-	/* Compute mask from target size (for Gear hash boundary detection) */
-	unsigned long target_size = repo_settings_get_chunk_target_size(the_repository);
-	int bits = 0;
-	size_t test = target_size;
-	while (test > 1) {
-		test >>= 1;
-		bits++;
-	}
-	sc->chunk_config.mask = bits > 0 ? (1ULL << bits) - 1 : CHUNK_MASK_DEFAULT;
+	/* chunk.minSize / targetSize / maxSize, checked (chunker.h) */
+	chunk_config_from_repo(the_repository, &sc->chunk_config);
 
 	/* Initialize arrays for chunk OIDs */
 	sc->chunk_capacity = 16;  /* Start small, grow as needed */
@@ -336,6 +338,7 @@ static int streaming_chunker_threads_init_common(struct streaming_chunker_thread
 	sc->cdc = (struct cdc_state)CDC_STATE_INIT;
 	sc->read_size = chunker_read_size(STREAMING_BUFFER_SIZE);
 	sc->error_occurred = 0;
+	sc->write_objects = 1;
 
 	/* Initialize parallel compression state */
 	sc->next_chunk_to_produce = 0;
@@ -495,7 +498,8 @@ static int consume_next_chunk(struct streaming_chunker_threads *sc)
 	 * Write pre-compressed chunk to ODB via bulk checkin.
 	 * Worker has already created [pack_header][compressed_data] and computed OID.
 	 */
-	if (index_precompressed_buffer_bulk_checkin(&w->chunk_oid,
+	if (sc->write_objects &&
+	    index_precompressed_buffer_bulk_checkin(&w->chunk_oid,
 	                                             (const char *)w->output_buffer,
 	                                             w->output_size,
 	                                             INDEX_WRITE_OBJECT) < 0) {
@@ -731,10 +735,10 @@ int streaming_chunker_threads_finalize(struct streaming_chunker_threads *sc,
 		return -1;
 	}
 
-	/* Create manifest object */
-	if (write_manifest_object(the_repository, manifest_oid, sc->total_size,
-	                          content_oid, sc->chunk_count,
-	                          sc->chunk_oids, sc->chunk_sizes) < 0) {
+	/* Create the manifest object, or only compute its id */
+	if ((sc->write_objects ? write_manifest_object : hash_manifest_object)(
+		    the_repository, manifest_oid, sc->total_size, content_oid,
+		    sc->chunk_count, sc->chunk_oids, sc->chunk_sizes) < 0) {
 		strbuf_addstr(&sc->error_message, "failed to create manifest object");
 		sc->error_occurred = 1;
 		return -1;

@@ -316,6 +316,7 @@ test_expect_success 'chunk.targetSize must be a power of two' '
 		bench -c chunk.targetSize=32k add t.bin &&
 		test "$(bench cat-file -p $(manifest_of t.bin) | sed -n 4p)" -gt 1 &&
 		bench rm -q --cached t.bin &&
+		bench config chunk.targetSize 32k &&
 		bench add t.bin
 	)
 '
@@ -368,11 +369,11 @@ test_expect_success 'cuts match the reference: min smaller than one read' '
 '
 
 test_expect_success 'cuts match the reference: min and max over one read' '
-	check_cuts 70000 65536 200000
+	check_cuts 70000 131072 200000
 '
 
-test_expect_success 'cuts match the reference: min = max (fixed-size chunks)' '
-	check_cuts 50000 65536 50000
+test_expect_success 'cuts match the reference: min = target = max (fixed-size chunks)' '
+	check_cuts 131072 131072 131072
 '
 
 test_expect_success 'fsck: a chunk line whose size is not the chunk size' '

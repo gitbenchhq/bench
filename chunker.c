@@ -4,6 +4,8 @@
 #include "strbuf.h"
 #include "hash.h"
 #include "repository.h"
+#include "repo-settings.h"
+#include "gettext.h"
 
 /*
  * Gear hash lookup table - 256 random 64-bit values
@@ -74,29 +76,54 @@ void init_gear_table(void)
 	gear_table_initialized = 1;
 }
 
-/*
- * Initialize chunk configuration with default values
- */
-void init_chunk_config(struct chunk_config *cfg)
+void chunk_config_init(struct chunk_config *cfg, unsigned long min,
+		       unsigned long target, unsigned long max)
 {
-	cfg->min_size = CHUNK_MIN_SIZE_DEFAULT;
-	cfg->max_size = CHUNK_MAX_SIZE_DEFAULT;
-	cfg->mask = CHUNK_MASK_DEFAULT;
+	int bits = 0;
+
+	/*
+	 * The chunker cuts where the low N bits of the gear hash are zero,
+	 * so the target is 2^N. Any other value would be silently rounded
+	 * down, so two "different" settings would chunk identically: refuse
+	 * it. 1 (2^0, a zero-bit mask) is refused too.
+	 */
+	if (target < 2 || (target & (target - 1))) {
+		unsigned long lower = 1;
+
+		if (target < 2)
+			die(_("chunk.targetSize is %lu; it must be a power of two "
+			      "of at least 2 (for example 16m)"), target);
+		while (lower <= target / 2)
+			lower <<= 1;
+		if (lower > ULONG_MAX / 2)
+			die(_("chunk.targetSize is %lu, which is not a power of two; "
+			      "use %lu"), target, lower);
+		die(_("chunk.targetSize is %lu, which is not a power of two; "
+		      "use %lu or %lu"), target, lower, lower << 1);
+	}
+	if (min > target)
+		die(_("chunk.minSize (%lu) is larger than chunk.targetSize (%lu); "
+		      "it must be at most the target"), min, target);
+	if (target > max)
+		die(_("chunk.targetSize (%lu) is larger than chunk.maxSize (%lu); "
+		      "it must be at most the maximum"), target, max);
+	if (max > CHUNK_MAX_SIZE_LIMIT)
+		die(_("chunk.maxSize is %lu; it must be at most %lu (1g), since "
+		      "each chunk is held in memory while it is compressed"),
+		    max, (unsigned long)CHUNK_MAX_SIZE_LIMIT);
+
+	while ((1UL << bits) < target)
+		bits++;
+	cfg->min_size = min;
+	cfg->max_size = max;
+	cfg->mask = (1ULL << bits) - 1;
 }
 
-/*
- * Initialize chunk configuration with custom target size
- *
- * The mask determines average chunk size: 2^target_bits
- * Examples:
- *   target_bits = 24 → mask = 0xFFFFFF → avg 16MB chunks
- *   target_bits = 26 → mask = 0x3FFFFFF → avg 64MB chunks
- */
-void init_chunk_config_custom(struct chunk_config *cfg, int target_bits)
+void chunk_config_from_repo(struct repository *r, struct chunk_config *cfg)
 {
-	cfg->min_size = CHUNK_MIN_SIZE_DEFAULT;
-	cfg->max_size = CHUNK_MAX_SIZE_DEFAULT;
-	cfg->mask = (1ULL << target_bits) - 1;
+	chunk_config_init(cfg, repo_settings_get_chunk_min_size(r),
+			  repo_settings_get_chunk_target_size(r),
+			  repo_settings_get_chunk_max_size(r));
 }
 
 /*

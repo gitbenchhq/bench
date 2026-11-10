@@ -1099,6 +1099,7 @@ integration_tests = [
   't9950-bench-manifest-format.sh',
   't9951-bench-roundtrip.sh',
   't9952-bench-vs-git-demo.sh',
+  't9953-bench-defaults.sh',
 ]
 
 benchmarks = [

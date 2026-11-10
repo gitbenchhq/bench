@@ -2529,7 +2529,8 @@ out:
 }
 
 static void repository_format_configure(struct repository_format *repo_fmt,
-					int hash, enum ref_storage_format ref_format)
+					int hash, enum ref_storage_format ref_format,
+					unsigned int init_flags)
 {
 	struct default_format_config cfg = {
 		.hash = GIT_HASH_UNKNOWN,
@@ -2541,6 +2542,7 @@ static void repository_format_configure(struct repository_format *repo_fmt,
 		.ignore_worktree = 1,
 	};
 	const char *env;
+	int existing;
 
 	config_with_options(read_default_format_config, &cfg, NULL, NULL, &opts);
 
@@ -2549,20 +2551,35 @@ static void repository_format_configure(struct repository_format *repo_fmt,
 	 * specify a different algorithm, as that could cause corruption.
 	 * Otherwise, if the user has specified one on the command line, use it.
 	 */
+	/*
+	 * An existing repository keeps its hash: its objects are named by
+	 * it. A config without core.repositoryformatversion reads as
+	 * version -1 although the repository exists, so also look for HEAD.
+	 * Only a new repository takes a default (GIT_DEFAULT_HASH,
+	 * init.defaultObjectFormat, or bench's own).
+	 */
+	existing = repo_fmt->version >= 0 || is_reinit();
 	env = getenv(GIT_DEFAULT_HASH_ENVIRONMENT);
-	if (repo_fmt->version >= 0 && hash != GIT_HASH_UNKNOWN && hash != repo_fmt->hash_algo)
+	if (existing && hash != GIT_HASH_UNKNOWN && hash != repo_fmt->hash_algo)
 		die(_("attempt to reinitialize repository with different hash"));
 	else if (hash != GIT_HASH_UNKNOWN)
 		repo_fmt->hash_algo = hash;
+	else if (existing && repo_fmt->hash_algo != GIT_HASH_UNKNOWN)
+		; /* keep it */
 	else if (env) {
 		int env_algo = hash_algo_by_name(env);
 		if (env_algo == GIT_HASH_UNKNOWN)
 			die(_("unknown hash algorithm '%s'"), env);
-		if (repo_fmt->version < 0 ||
-		    repo_fmt->hash_algo == GIT_HASH_UNKNOWN)
-			repo_fmt->hash_algo = env_algo;
+		repo_fmt->hash_algo = env_algo;
 	} else if (cfg.hash != GIT_HASH_UNKNOWN) {
 		repo_fmt->hash_algo = cfg.hash;
+	} else if (!existing && !(init_flags & INIT_DB_GIT_COMPAT)) {
+		/*
+		 * A new bench repository uses SHA-256 unless the user chose
+		 * otherwise above. A git-compatible repository keeps git's
+		 * default so plain git can read it.
+		 */
+		repo_fmt->hash_algo = GIT_HASH_SHA256;
 	}
 	repo_set_hash_algo(the_repository, repo_fmt->hash_algo);
 
@@ -2626,7 +2643,7 @@ int init_db(const char *git_dir, const char *real_git_dir,
 	 */
 	check_repository_format(&repo_fmt);
 
-	repository_format_configure(&repo_fmt, hash, ref_storage_format);
+	repository_format_configure(&repo_fmt, hash, ref_storage_format, flags);
 
 	/*
 	 * Ensure `core.hidedotfiles` is processed. This must happen after we

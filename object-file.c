@@ -1301,7 +1301,7 @@ int index_fd(struct index_state *istate, struct object_id *oid,
 /* Process file using serial streaming chunker */
 static int process_large_file_serial(const char *path, int fd, size_t file_size,
                                      const char *buffer, size_t buffer_len,
-                                     struct object_id *oid)
+                                     struct object_id *oid, unsigned flags)
 {
 	struct streaming_chunker sc;
 	struct object_id content_oid;
@@ -1322,6 +1322,9 @@ static int process_large_file_serial(const char *path, int fd, size_t file_size,
 			return error(_("%s: failed to initialize chunker"), path);
 		}
 	}
+
+	/* Store the chunks and manifest, or only compute their ids */
+	sc.write_objects = !!(flags & INDEX_WRITE_OBJECT);
 
 	/* Process file/buffer */
 	if (streaming_chunker_process_file(&sc) < 0) {
@@ -1349,7 +1352,7 @@ static int process_large_file_serial(const char *path, int fd, size_t file_size,
 /* Process file using parallel streaming chunker */
 static int process_large_file_parallel(const char *path, int fd, size_t file_size,
                                        const char *buffer, size_t buffer_len,
-                                       struct object_id *oid)
+                                       struct object_id *oid, unsigned flags)
 {
 	struct streaming_chunker_threads sc;
 	struct object_id content_oid;
@@ -1370,6 +1373,9 @@ static int process_large_file_parallel(const char *path, int fd, size_t file_siz
 			return error(_("%s: failed to initialize parallel chunker"), path);
 		}
 	}
+
+	/* Store the chunks and manifest, or only compute their ids */
+	sc.write_objects = !!(flags & INDEX_WRITE_OBJECT);
 
 	/* Process file/buffer with parallel workers */
 	if (streaming_chunker_threads_process_file(&sc) < 0) {
@@ -1397,17 +1403,17 @@ static int process_large_file_parallel(const char *path, int fd, size_t file_siz
 /* Wrapper: choose parallel or serial path based on settings */
 static int process_large_file(const char *path, int fd, size_t file_size,
                               const char *buffer, size_t buffer_len,
-                              struct object_id *oid)
+                              struct object_id *oid, unsigned flags)
 {
 #ifdef BENCH_THREADS
 	/* Use parallel path if file is large enough and threads enabled */
 	int num_threads = repo_settings_get_bench_threads(the_repository);
 	if (num_threads > 1) {
-		return process_large_file_parallel(path, fd, file_size, buffer, buffer_len, oid);
+		return process_large_file_parallel(path, fd, file_size, buffer, buffer_len, oid, flags);
 	}
 #endif
 	/* Fall back to serial path */
-	return process_large_file_serial(path, fd, file_size, buffer, buffer_len, oid);
+	return process_large_file_serial(path, fd, file_size, buffer, buffer_len, oid, flags);
 }
 
 int index_path(struct index_state *istate, struct object_id *oid,
@@ -1442,17 +1448,62 @@ int index_path(struct index_state *istate, struct object_id *oid,
 				struct object_id chunk_oid;
 				unsigned long chunk_size;
 
-				/* Create the chunk (entire file as one blob) */
-				if (index_fd(istate, &chunk_oid, fd, st, OBJ_BLOB, path, flags) < 0)
-					return error(_("%s: failed to insert chunk into database"),
-						     path);
+				if (flags & INDEX_WRITE_OBJECT) {
+					/* Create the chunk (entire file as one blob) */
+					if (index_fd(istate, &chunk_oid, fd, st, OBJ_BLOB, path, flags) < 0)
+						return error(_("%s: failed to insert chunk into database"),
+							     path);
 
-				/*
-				 * Get the actual size of the chunk (may differ from st->st_size if filters were applied).
-				 * For example, CRLF normalization may reduce file size.
-				 */
-				if (oid_object_info(repo, &chunk_oid, &chunk_size) < 0)
-					return error(_("%s: failed to get chunk size"), path);
+					/*
+					 * The chunk's size after conversion (CRLF
+					 * normalization may shrink it), from the
+					 * object just written.
+					 */
+					if (oid_object_info(repo, &chunk_oid, &chunk_size) < 0)
+						return error(_("%s: failed to get chunk size"), path);
+				} else {
+					/*
+					 * Only hashing (add --dry-run, diff against the
+					 * working tree): the chunk is not stored, so its
+					 * size cannot be looked up. Convert and hash the
+					 * file here, as index_fd() does for a file this
+					 * small, so the size and the hash come from the
+					 * same bytes. The file is at most chunk.minSize.
+					 */
+					struct strbuf buf = STRBUF_INIT;
+					struct strbuf converted = STRBUF_INIT;
+					size_t size = xsize_t(st->st_size);
+					ssize_t got;
+					int ret;
+
+					/*
+					 * Exactly st_size bytes, like the write path
+					 * (index_core): a file that grows meanwhile
+					 * is refused, not hashed with other bytes.
+					 */
+					strbuf_grow(&buf, size);
+					got = read_in_full(fd, buf.buf, size);
+					close(fd);
+					if (got < 0 || (size_t)got != size) {
+						ret = got < 0
+							? error_errno(_("read error while indexing %s"), path)
+							: error(_("short read while indexing %s"), path);
+						strbuf_release(&buf);
+						return ret;
+					}
+					strbuf_setlen(&buf, size);
+					if (convert_to_git(istate, path, buf.buf, buf.len,
+							   &converted, get_conv_flags(flags)))
+						strbuf_swap(&buf, &converted);
+					/* path NULL: already converted above */
+					ret = index_mem(istate, &chunk_oid, buf.buf, buf.len,
+							OBJ_BLOB, NULL, flags);
+					chunk_size = buf.len;
+					strbuf_release(&buf);
+					strbuf_release(&converted);
+					if (ret < 0)
+						return error(_("%s: failed to hash chunk"), path);
+				}
 
 				/*
 				 * Create manifest pointing to this single chunk.
@@ -1506,7 +1557,7 @@ int index_path(struct index_state *istate, struct object_id *oid,
 
 					/* Chunk the filtered data using buffer interface */
 					/* BENCH_THREADS: Use parallel or serial path based on settings */
-					rc = process_large_file(path, -1, 0, data_to_chunk, data_len, oid);
+					rc = process_large_file(path, -1, 0, data_to_chunk, data_len, oid, flags);
 					if (rc < 0)
 						goto cleanup_filter;
 
@@ -1529,7 +1580,7 @@ int index_path(struct index_state *istate, struct object_id *oid,
 
 					/* Fall through to streaming chunker (no filters) */
 					/* BENCH_THREADS: Use parallel or serial path based on settings */
-					rc = process_large_file(path, fd, st->st_size, NULL, 0, oid);
+					rc = process_large_file(path, fd, st->st_size, NULL, 0, oid, flags);
 					close(fd);
 					if (rc < 0)
 						return rc;
@@ -1540,7 +1591,7 @@ int index_path(struct index_state *istate, struct object_id *oid,
 				 * Use streaming chunker with content-defined chunking.
 				 * BENCH_THREADS: Use parallel or serial path based on settings.
 				 */
-				rc = process_large_file(path, fd, st->st_size, NULL, 0, oid);
+				rc = process_large_file(path, fd, st->st_size, NULL, 0, oid, flags);
 				close(fd);
 				if (rc < 0)
 					return rc;

@@ -115,7 +115,7 @@ boundary_read_size () {
 	awk "{ for (r = 65536; r > 0; r--) if (\$1 % r == 0) { print r; exit } }"
 }
 
-for cfg in "4096 8192 32768" "70000 65536 200000" "50000 65536 50000"
+for cfg in "4096 8192 32768" "70000 131072 200000" "131072 131072 131072"
 do
 	set -- $cfg
 	min=$1 target=$2 max=$3
