@@ -384,8 +384,8 @@ static int fsck_walk_tree(struct tree *tree, void *data, struct fsck_options *op
 			result = options->walk(obj, OBJ_TREE, data, options);
 		}
 		else if (S_ISREG(entry.mode) || S_ISLNK(entry.mode) || S_ISMANIFEST(entry.mode)) {
-			/* Regular files can be blobs or manifests depending on mode */
-			if (object_type(entry.mode) == OBJ_MANIFEST) {
+			/* Blob or manifest: bench stores files and symlinks as manifests */
+			if (entry_object_type(the_repository, entry.mode) == OBJ_MANIFEST) {
 				obj = (struct object *)lookup_manifest(the_repository, &entry.oid);
 				if (name && obj)
 					fsck_put_object_name(options, &entry.oid, "%s%s",
@@ -1430,6 +1430,59 @@ int fsck_refs_error_function(struct fsck_options *options UNUSED,
 	return ret;
 }
 
+/*
+ * bench stores .benchmodules and .benchattributes, like every file, as a
+ * manifest: check the content it holds as fsck_blob() checks a blob's.
+ * The size comes from the manifest header, so content too large to
+ * check is reported without being read.
+ */
+static int fsck_manifest_content(const struct object_id *oid,
+				 const char *buf, unsigned long size,
+				 enum fsck_msg_id msg_missing,
+				 struct fsck_options *options,
+				 const char *blob_type)
+{
+	struct manifest_header header;
+	struct oid_array chunks = OID_ARRAY_INIT;
+	unsigned long content_size;
+	uint64_t total_size;
+	char *content;
+	int ret;
+	size_t i;
+
+	/* A manifest that does not parse is reported by fsck_manifest(). */
+	if (parse_manifest(the_repository->hash_algo, buf, size,
+			   MANIFEST_PARSE_HEADER_ONLY, &header, NULL))
+		return 0;
+	/* fsck_blob() reports a missing buffer as too large to parse. */
+	if (header.total_size > ATTR_MAX_FILE_SIZE)
+		return fsck_blob(oid, NULL, 0, options);
+
+	content = read_manifest_content(the_repository, oid, &content_size);
+	if (content) {
+		ret = fsck_blob(oid, content, content_size, options);
+		free(content);
+		return ret;
+	}
+
+	/* As for a missing blob: a chunk a promisor remote has is fine. */
+	ret = 0;
+	if (!get_manifest_chunk_oids(the_repository, oid, &total_size, &chunks)) {
+		for (i = 0; i < chunks.nr; i++)
+			if (!odb_has_object(the_repository->objects,
+					    &chunks.oid[i], 0) &&
+			    is_promisor_object(the_repository, &chunks.oid[i]))
+				break;
+		if (i < chunks.nr)
+			ret = 1;
+	}
+	oid_array_clear(&chunks);
+	if (ret)
+		return 0;
+	return report(options, oid, OBJ_BLOB, msg_missing,
+		      "unable to read %s content", blob_type);
+}
+
 static int fsck_blobs(struct oidset *blobs_found, struct oidset *blobs_done,
 		      enum fsck_msg_id msg_missing, enum fsck_msg_id msg_type,
 		      struct fsck_options *options, const char *blob_type)
@@ -1459,6 +1512,9 @@ static int fsck_blobs(struct oidset *blobs_found, struct oidset *blobs_done,
 
 		if (type == OBJ_BLOB)
 			ret |= fsck_blob(oid, buf, size, options);
+		else if (type == OBJ_MANIFEST)
+			ret |= fsck_manifest_content(oid, buf, size, msg_missing,
+						     options, blob_type);
 		else
 			ret |= report(options, oid, type, msg_type,
 				      "non-blob found at %s", blob_type);

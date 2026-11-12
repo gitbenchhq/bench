@@ -1101,6 +1101,7 @@ integration_tests = [
   't9952-bench-vs-git-demo.sh',
   't9953-bench-defaults.sh',
   't9954-bench-diff-stat-dirty.sh',
+  't9955-bench-fsck-special-files.sh',
 ]
 
 benchmarks = [

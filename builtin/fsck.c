@@ -834,7 +834,7 @@ static void fsck_index(struct index_state *istate, const char *index_path,
 			continue;
 		
 		/* Handle blob vs manifest based on cache entry mode */
-		if (object_type(mode) == OBJ_MANIFEST) {
+		if (entry_object_type(the_repository, mode) == OBJ_MANIFEST) {
 			struct manifest *manifest = lookup_manifest(the_repository,
 							    &istate->cache[i]->oid);
 			if (!manifest)

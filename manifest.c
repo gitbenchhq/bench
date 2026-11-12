@@ -194,6 +194,13 @@ static int parse_manifest_object(struct repository *r,
 	return ret;
 }
 
+enum object_type entry_object_type(struct repository *r, unsigned int mode)
+{
+	if (S_ISLNK(mode) && repo_has_bench_extensions(r))
+		return OBJ_MANIFEST;
+	return object_type(mode);
+}
+
 struct manifest_stream *open_manifest_stream(struct repository *r,
                                              const struct object_id *manifest_oid,
                                              unsigned long *size)

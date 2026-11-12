@@ -82,6 +82,13 @@ int get_manifest_content_info(struct repository *r,
 void free_manifest(struct manifest *m);
 
 /* Streaming interface for manifest content */
+/**
+ * The type of the object a tree or index entry with this mode points to.
+ * As object_type(), except that in a bench repository a symlink's target
+ * is stored as a manifest, like a regular file's content.
+ **/
+enum object_type entry_object_type(struct repository *r, unsigned int mode);
+
 struct manifest_stream;
 
 /**
