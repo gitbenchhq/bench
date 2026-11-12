@@ -244,33 +244,6 @@ static int ce_compare_data(struct index_state *istate,
 	return match;
 }
 
-static int ce_compare_manifest_with_file(struct index_state *istate,
-					 const struct cache_entry *ce,
-					 struct stat *st)
-{
-	struct object_id manifest_content_oid;
-	int match = -1;
-	int fd;
-	
-	/* Get content OID from manifest */
-	if (get_manifest_content_oid(istate->repo, &ce->oid, &manifest_content_oid) < 0)
-		return 1; /* Error reading manifest - assume changed */
-	
-	/* Hash working tree file and compare with manifest's content OID */
-	fd = git_open_cloexec(ce->name, O_RDONLY);
-	if (fd >= 0) {
-		struct object_id file_oid;
-		/* Use Git's standard file hashing (includes filters) */
-		if (!index_fd(istate, &file_oid, fd, st, OBJ_BLOB, ce->name, 0)) {
-			/* Compare file hash with manifest's content hash */
-			match = !oideq(&file_oid, &manifest_content_oid);
-		}
-		/* index_fd() closed the file descriptor already */
-	}
-	
-	return match;
-}
-
 static int ce_compare_link(const struct cache_entry *ce, size_t expected_size)
 {
 	int match = -1;
@@ -340,7 +313,8 @@ static int ce_modified_check_fs(struct index_state *istate,
 		 * Compare manifest content with file content via streaming.
 		 */
 		if (S_ISMANIFEST(ce->ce_mode)) {
-			if (ce_compare_manifest_with_file(istate, ce, st))
+			if (working_file_differs_from_manifest(istate, ce->name,
+							       st, &ce->oid))
 				return DATA_CHANGED;
 			break;
 		}
@@ -972,7 +946,8 @@ struct cache_entry *make_transient_cache_entry(unsigned int mode,
 int chmod_index_entry(struct index_state *istate, struct cache_entry *ce,
 		      char flip)
 {
-	if (!S_ISREG(ce->ce_mode))
+	/* A manifest is a regular file stored in chunks. */
+	if (!S_ISREG(ce->ce_mode) && !S_ISMANIFEST(ce->ce_mode))
 		return -1;
 	switch (flip) {
 	case '+':

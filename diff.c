@@ -6980,6 +6980,28 @@ static int diff_filespec_check_stat_unmatch(struct repository *r,
 
 	p->done_skip_stat_unmatch = 1;
 	p->skip_stat_unmatch_result = 0;
+
+	/*
+	 * A manifest against the working tree file it was stored from: ask
+	 * whether the file still holds the manifest's content, as the index
+	 * refresh does, instead of loading both sides to compare them (a
+	 * manifest's content can be any size). The side without an object
+	 * name is the working tree file; it is either side under -R.
+	 */
+	if (DIFF_FILE_VALID(p->one) && DIFF_FILE_VALID(p->two) &&
+	    S_ISMANIFEST(p->one->mode) && p->one->mode == p->two->mode &&
+	    p->one->oid_valid != p->two->oid_valid) {
+		struct diff_filespec *stored = p->one->oid_valid ? p->one : p->two;
+		struct diff_filespec *file = p->one->oid_valid ? p->two : p->one;
+		struct stat st;
+
+		p->skip_stat_unmatch_result =
+			lstat(file->path, &st) || !S_ISREG(st.st_mode) ||
+			working_file_differs_from_manifest(r->index, file->path,
+							   &st, &stored->oid);
+		return p->skip_stat_unmatch_result;
+	}
+
 	/*
 	 * 1. Entries that come from stat info dirtiness
 	 *    always have both sides (iow, not create/delete),

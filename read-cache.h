@@ -12,6 +12,16 @@ static inline unsigned int ce_mode_from_stat(const struct cache_entry *ce,
 	if (!has_symlinks && S_ISREG(mode) &&
 	    ce && S_ISLNK(ce->ce_mode))
 		return ce->ce_mode;
+	/*
+	 * A regular file whose index entry is a manifest keeps the
+	 * manifest type: the working tree has no other way to show it, and
+	 * a different type would make an unchanged file look replaced.
+	 */
+	if (S_ISREG(mode) && ce && S_ISMANIFEST(ce->ce_mode)) {
+		if (!trust_executable_bit)
+			return ce->ce_mode;
+		return S_IFMANIFEST | ce_permissions(mode);
+	}
 	if (!trust_executable_bit && S_ISREG(mode)) {
 		if (ce && S_ISREG(ce->ce_mode))
 			return ce->ce_mode;

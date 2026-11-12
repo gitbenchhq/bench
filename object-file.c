@@ -1416,6 +1416,84 @@ static int process_large_file(const char *path, int fd, size_t file_size,
 	return process_large_file_serial(path, fd, file_size, buffer, buffer_len, oid, flags);
 }
 
+/*
+ * Whether bench stores the file with its filters (CRLF, ident, clean
+ * filters) applied: always for a single-chunk file, and for a chunked file
+ * up to core.bigFileThreshold. A larger file is stored unfiltered. The one
+ * rule for index_path(), which stores the file, and for
+ * working_file_differs_from_manifest(), which predicts what it would store.
+ */
+static int bench_add_filters(struct index_state *istate, const char *path,
+			     off_t size)
+{
+	struct repository *repo = istate && istate->repo ? istate->repo : the_repository;
+
+	if (!would_convert_to_git(istate, path))
+		return 0;
+	return !should_chunk_file(size) ||
+	       size <= (off_t)repo_settings_get_big_file_threshold(repo);
+}
+
+/*
+ * Read the regular file open at fd, exactly st->st_size bytes, and apply
+ * its filters as bench stores it, into out. conv_flags are the flags for
+ * convert_to_git(): add passes its write flags (core.safecrlf can warn or
+ * refuse), a command that only compares passes 0. A file whose size is no
+ * longer st->st_size is refused, as the chunker refuses it. The caller
+ * closes fd and releases out.
+ */
+static int read_file_as_stored(struct index_state *istate, const char *path,
+			       int fd, const struct stat *st, int conv_flags,
+			       struct strbuf *out)
+{
+	size_t size = xsize_t(st->st_size);
+	struct strbuf converted = STRBUF_INIT;
+	ssize_t got;
+	char extra;
+
+	strbuf_reset(out);
+	strbuf_grow(out, size);
+	got = read_in_full(fd, out->buf, size);
+	if (got < 0)
+		return error_errno(_("read error while indexing %s"), path);
+	if ((size_t)got != size || xread(fd, &extra, 1) != 0)
+		return error(_("%s changed while it was read"), path);
+	strbuf_setlen(out, size);
+
+	/*
+	 * Converted, the output is what is stored, even if it is empty. A
+	 * filter that fails has already reported it: convert_to_git() then
+	 * keeps the file as it is, or dies if the filter is required.
+	 */
+	if (convert_to_git(istate, path, out->buf, out->len, &converted,
+			   conv_flags))
+		strbuf_swap(out, &converted);
+	strbuf_release(&converted);
+	return 0;
+}
+
+/*
+ * Store buf, already converted, as one chunk and the manifest pointing to
+ * it, the layout of a file of at most chunk.minSize; with hash-only flags,
+ * only compute the manifest's id.
+ */
+static int index_single_chunk(struct index_state *istate,
+			      struct object_id *oid, const char *path,
+			      const char *buf, size_t len, unsigned flags)
+{
+	struct repository *repo = istate && istate->repo ? istate->repo : the_repository;
+	struct object_id chunk_oid;
+	uint64_t size64 = len;
+
+	/* path NULL: buf is already converted */
+	if (index_mem(istate, &chunk_oid, buf, len, OBJ_BLOB, NULL, flags) < 0)
+		return error(_("%s: failed to hash chunk"), path);
+	if ((flags & INDEX_WRITE_OBJECT ? write_manifest_object : hash_manifest_object)(
+		    repo, oid, size64, &chunk_oid, 1, &chunk_oid, &size64) < 0)
+		return error(_("%s: failed to create manifest"), path);
+	return 0;
+}
+
 int index_path(struct index_state *istate, struct object_id *oid,
 	       const char *path, struct stat *st, unsigned flags)
 {
@@ -1435,20 +1513,21 @@ int index_path(struct index_state *istate, struct object_id *oid,
 			/*
 			 * Bench mode decision tree:
 			 * 1. Small files (≤ chunk.minSize): Use Git's single-blob path
-			 * 2. Medium files with filters (chunk.minSize < size ≤ 512MB):
-			 *    Load → Filter → Chunk buffer
-			 * 3. Large files with filters (> 512MB): Error + chunk without filter
-			 * 4. Large files without filters (> chunk.minSize): Stream chunk
+			 * 2. Chunked files with filters, up to core.bigFileThreshold
+			 *    (bench_add_filters()): Load → Filter → Chunk buffer
+			 * 3. Other chunked files: Stream chunk unfiltered (warn if
+			 *    the file has filters, i.e. it is above the threshold)
 			 */
 			if (!should_chunk_file(st->st_size)) {
 				/*
 				 * Small file or empty file: create single-chunk manifest.
 				 * This is the fast path for files <= chunk.minSize (default 2MB).
 				 */
-				struct object_id chunk_oid;
-				unsigned long chunk_size;
-
 				if (flags & INDEX_WRITE_OBJECT) {
+					struct object_id chunk_oid;
+					unsigned long chunk_size;
+					uint64_t size64;
+
 					/* Create the chunk (entire file as one blob) */
 					if (index_fd(istate, &chunk_oid, fd, st, OBJ_BLOB, path, flags) < 0)
 						return error(_("%s: failed to insert chunk into database"),
@@ -1457,10 +1536,14 @@ int index_path(struct index_state *istate, struct object_id *oid,
 					/*
 					 * The chunk's size after conversion (CRLF
 					 * normalization may shrink it), from the
-					 * object just written.
+					 * object just written. For a single chunk,
+					 * the content id is the chunk's id.
 					 */
 					if (oid_object_info(repo, &chunk_oid, &chunk_size) < 0)
 						return error(_("%s: failed to get chunk size"), path);
+					size64 = chunk_size;
+					if (write_manifest_object(repo, oid, size64, &chunk_oid, 1, &chunk_oid, &size64) < 0)
+						rc = error(_("%s: failed to create manifest"), path);
 				} else {
 					/*
 					 * Only hashing (add --dry-run, diff against the
@@ -1471,126 +1554,58 @@ int index_path(struct index_state *istate, struct object_id *oid,
 					 * same bytes. The file is at most chunk.minSize.
 					 */
 					struct strbuf buf = STRBUF_INIT;
-					struct strbuf converted = STRBUF_INIT;
-					size_t size = xsize_t(st->st_size);
-					ssize_t got;
-					int ret;
 
-					/*
-					 * Exactly st_size bytes, like the write path
-					 * (index_core): a file that grows meanwhile
-					 * is refused, not hashed with other bytes.
-					 */
-					strbuf_grow(&buf, size);
-					got = read_in_full(fd, buf.buf, size);
+					rc = read_file_as_stored(istate, path, fd, st,
+								 get_conv_flags(flags), &buf);
 					close(fd);
-					if (got < 0 || (size_t)got != size) {
-						ret = got < 0
-							? error_errno(_("read error while indexing %s"), path)
-							: error(_("short read while indexing %s"), path);
-						strbuf_release(&buf);
-						return ret;
-					}
-					strbuf_setlen(&buf, size);
-					if (convert_to_git(istate, path, buf.buf, buf.len,
-							   &converted, get_conv_flags(flags)))
-						strbuf_swap(&buf, &converted);
-					/* path NULL: already converted above */
-					ret = index_mem(istate, &chunk_oid, buf.buf, buf.len,
-							OBJ_BLOB, NULL, flags);
-					chunk_size = buf.len;
+					if (!rc)
+						rc = index_single_chunk(istate, oid, path, buf.buf,
+									buf.len, flags);
 					strbuf_release(&buf);
-					strbuf_release(&converted);
-					if (ret < 0)
-						return error(_("%s: failed to hash chunk"), path);
-				}
-
-				/*
-				 * Create manifest pointing to this single chunk.
-				 * For single chunk, content OID equals chunk OID.
-				 * Use chunk_size (filtered size) not st->st_size (working tree size).
-				 */
-				uint64_t size64 = chunk_size;
-				if (flags & INDEX_WRITE_OBJECT) {
-					if (write_manifest_object(repo, oid, size64, &chunk_oid, 1, &chunk_oid, &size64) < 0)
-						rc = error(_("%s: failed to create manifest"), path);
-				} else {
-					/* Just hashing - create manifest hash without writing */
-					if (hash_manifest_object(repo, oid, size64, &chunk_oid, 1, &chunk_oid, &size64) < 0)
-						rc = error(_("%s: failed to hash manifest"), path);
-				}
-			} else if (would_convert_to_git(istate, path)) {
-				/*
-				 * Large file with filters: check if manageable (<= 512MB)
-				 */
-				unsigned long big_file_threshold = repo_settings_get_big_file_threshold(repo);
-
-				if (st->st_size <= big_file_threshold) {
-					/*
-					 * Medium file (chunk.minSize < size <= 512MB) with filters:
-					 * Load file → Apply filters → Chunk filtered data
-					 */
-					struct strbuf file_content = STRBUF_INIT;
-					struct strbuf filtered = STRBUF_INIT;
-
-					/* Read entire file into memory */
-					if (strbuf_read(&file_content, fd, st->st_size) < 0) {
-						rc = error_errno(_("%s: failed to read file"), path);
-						strbuf_release(&file_content);
-						close(fd);
-						return rc;
-					}
-					close(fd);  /* Done with file descriptor */
-
-					/* Apply Git's filters (CRLF, ident, clean, etc.) */
-					int conversion_result = convert_to_git(istate, path,
-					                                      file_content.buf, file_content.len,
-					                                      &filtered, get_conv_flags(flags));
-
-					/* Use filtered data if conversion happened, otherwise use original */
-					const char *data_to_chunk = conversion_result && filtered.len > 0
-					                           ? filtered.buf
-					                           : file_content.buf;
-					size_t data_len = conversion_result && filtered.len > 0
-					                 ? filtered.len
-					                 : file_content.len;
-
-					/* Chunk the filtered data using buffer interface */
-					/* BENCH_THREADS: Use parallel or serial path based on settings */
-					rc = process_large_file(path, -1, 0, data_to_chunk, data_len, oid, flags);
 					if (rc < 0)
-						goto cleanup_filter;
+						return rc;
+				}
+			} else if (bench_add_filters(istate, path, st->st_size)) {
+				/*
+				 * Chunked file with filters, up to core.bigFileThreshold:
+				 * load it, filter it, chunk the filtered data.
+				 */
+				struct strbuf data = STRBUF_INIT;
 
-				cleanup_filter:
-					strbuf_release(&filtered);
-					strbuf_release(&file_content);
-
-				} else {
-					/*
-					 * Large file (> 512MB) with filters:
-					 * Warn and stream the chunks without filters
-					 */
+				rc = read_file_as_stored(istate, path, fd, st,
+							 get_conv_flags(flags), &data);
+				close(fd);
+				/*
+				 * A filter may give no output: stored as an empty
+				 * file is, as one empty chunk.
+				 * BENCH_THREADS: parallel or serial path, based on settings.
+				 */
+				if (!rc && !data.len)
+					rc = index_single_chunk(istate, oid, path, data.buf,
+								0, flags);
+				else if (!rc)
+					rc = process_large_file(path, -1, 0, data.buf,
+								data.len, oid, flags);
+				strbuf_release(&data);
+				if (rc < 0)
+					return rc;
+			} else {
+				/*
+				 * Chunked file stored unfiltered: it has no filters, or it is
+				 * larger than core.bigFileThreshold (warned here). Streamed
+				 * through content-defined chunking.
+				 * BENCH_THREADS: parallel or serial path, based on settings.
+				 */
+				if (would_convert_to_git(istate, path)) {
 					struct strbuf lim = STRBUF_INIT;
 
-					strbuf_humanise_bytes(&lim, big_file_threshold);
+					strbuf_humanise_bytes(&lim,
+						repo_settings_get_big_file_threshold(repo));
 					warning(_("%s: larger than %s (core.bigFileThreshold), so its "
 						  "filters are not applied; it is stored unfiltered"),
 						path, lim.buf);
 					strbuf_release(&lim);
-
-					/* Fall through to streaming chunker (no filters) */
-					/* BENCH_THREADS: Use parallel or serial path based on settings */
-					rc = process_large_file(path, fd, st->st_size, NULL, 0, oid, flags);
-					close(fd);
-					if (rc < 0)
-						return rc;
 				}
-			} else {
-				/*
-				 * Large file (> chunk.minSize) without filters:
-				 * Use streaming chunker with content-defined chunking.
-				 * BENCH_THREADS: Use parallel or serial path based on settings.
-				 */
 				rc = process_large_file(path, fd, st->st_size, NULL, 0, oid, flags);
 				close(fd);
 				if (rc < 0)
@@ -1645,6 +1660,89 @@ int index_path(struct index_state *istate, struct object_id *oid,
 		return error(_("%s: unsupported file type"), path);
 	}
 	return rc;
+}
+
+/*
+ * The id of the content index_path() stores for the regular file at path,
+ * as one blob (a manifest's content_oid), without writing anything. A file
+ * that is filtered is read whole by read_file_as_stored(), as index_path()
+ * reads it; any other file is streamed.
+ */
+static int hash_file_content_as_added(struct index_state *istate,
+				      const char *path, struct stat *st,
+				      struct object_id *oid)
+{
+	struct repository *repo = istate->repo ? istate->repo : the_repository;
+	const struct git_hash_algo *algo = repo->hash_algo;
+	size_t size = xsize_t(st->st_size);
+	int fd = git_open_cloexec(path, O_RDONLY);
+	int ret = 0;
+
+	if (fd < 0)
+		return error_errno(_("unable to open %s"), path);
+
+	if (bench_add_filters(istate, path, st->st_size)) {
+		struct strbuf buf = STRBUF_INIT;
+
+		/* Filter flags 0: comparing must not warn or die on safecrlf. */
+		ret = read_file_as_stored(istate, path, fd, st, 0, &buf);
+		if (!ret)
+			hash_object_file(algo, buf.buf, buf.len, OBJ_BLOB, oid);
+		strbuf_release(&buf);
+	} else {
+		struct git_hash_ctx ctx;
+		char hdr[MAX_HEADER_LEN];
+		int hdrlen = format_object_header(hdr, sizeof(hdr), OBJ_BLOB, size);
+		const size_t bufsize = 64 * 1024;
+		char *buf = xmalloc(bufsize);
+		size_t left = size;
+
+		algo->init_fn(&ctx);
+		git_hash_update(&ctx, hdr, hdrlen);
+		while (left) {
+			ssize_t got = xread(fd, buf, left < bufsize ? left : bufsize);
+			if (got <= 0) {
+				ret = got < 0
+					? error_errno(_("read error while indexing %s"), path)
+					: error(_("%s changed while it was read"), path);
+				break;
+			}
+			git_hash_update(&ctx, buf, got);
+			left -= got;
+		}
+		/* As read_file_as_stored(): the size must still be st_size. */
+		if (!ret && xread(fd, buf, 1) != 0)
+			ret = error(_("%s changed while it was read"), path);
+		if (ret) {
+			unsigned char discard[GIT_MAX_RAWSZ];
+			git_hash_final(discard, &ctx);
+		} else {
+			git_hash_final_oid(oid, &ctx);
+		}
+		free(buf);
+	}
+	close(fd);
+	return ret;
+}
+
+int working_file_differs_from_manifest(struct index_state *istate,
+				       const char *path, struct stat *st,
+				       const struct object_id *manifest_oid)
+{
+	struct repository *repo = istate->repo ? istate->repo : the_repository;
+	struct object_id content_oid, file_oid;
+	uint64_t total_size;
+
+	if (get_manifest_content_info(repo, manifest_oid, &total_size,
+				      &content_oid) < 0)
+		return -1;
+	/* Unfiltered, the stored size is the file's size. */
+	if (!bench_add_filters(istate, path, st->st_size) &&
+	    (uint64_t)st->st_size != total_size)
+		return 1;
+	if (hash_file_content_as_added(istate, path, st, &file_oid) < 0)
+		return -1;
+	return !oideq(&file_oid, &content_oid);
 }
 
 int read_pack_header(int fd, struct pack_header *header)

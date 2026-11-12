@@ -1100,6 +1100,7 @@ integration_tests = [
   't9951-bench-roundtrip.sh',
   't9952-bench-vs-git-demo.sh',
   't9953-bench-defaults.sh',
+  't9954-bench-diff-stat-dirty.sh',
 ]
 
 benchmarks = [

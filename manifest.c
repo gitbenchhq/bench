@@ -625,28 +625,28 @@ int hash_manifest_object(struct repository *r, struct object_id *oid,
 	return 0;
 }
 
-int get_manifest_content_oid(struct repository *r,
-                             const struct object_id *manifest_oid,
-                             struct object_id *content_oid)
+int get_manifest_content_info(struct repository *r,
+			      const struct object_id *manifest_oid,
+			      uint64_t *total_size,
+			      struct object_id *content_oid)
 {
 	struct manifest_header header;
 	void *manifest_buffer;
 	unsigned long manifest_size;
 	enum object_type type;
 	int ret = -1;
-	
-	/* Read manifest object */
+
 	manifest_buffer = odb_read_object(r->objects, manifest_oid, &type, &manifest_size);
-	if (!manifest_buffer || type != OBJ_MANIFEST)
+	if (!manifest_buffer || type != OBJ_MANIFEST) {
+		free(manifest_buffer);
 		return -1;
-	
-	/* Parse header to get content OID */
-	if (parse_manifest_object(r, manifest_oid, manifest_buffer, manifest_size,
-				  MANIFEST_PARSE_HEADER_ONLY, &header) == 0) {
+	}
+	if (!parse_manifest_object(r, manifest_oid, manifest_buffer, manifest_size,
+				   MANIFEST_PARSE_HEADER_ONLY, &header)) {
+		*total_size = header.total_size;
 		oidcpy(content_oid, &header.content_oid);
 		ret = 0;
 	}
-	
 	free(manifest_buffer);
 	return ret;
 }

@@ -67,13 +67,14 @@ int hash_manifest_object(struct repository *r, struct object_id *oid,
                         const uint64_t *chunk_sizes);
 
 /**
- * Get the content OID from a manifest object.
- * This returns the OID representing the complete file content after filters.
+ * Get a manifest's content size and content OID (the id of the complete
+ * file content after filters) from its header.
  * Returns 0 on success, -1 on error.
  **/
-int get_manifest_content_oid(struct repository *r,
-                             const struct object_id *manifest_oid,
-                             struct object_id *content_oid);
+int get_manifest_content_info(struct repository *r,
+			      const struct object_id *manifest_oid,
+			      uint64_t *total_size,
+			      struct object_id *content_oid);
 
 /**
  * Free the memory associated with a manifest's chunk list.

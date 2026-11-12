@@ -373,27 +373,29 @@ static int write_entry(struct cache_entry *ce, char *path, struct conv_attrs *ca
 	
 	/*
 	 * Manifests are streamed, so a large file is never loaded into
-	 * memory. The exception is a conversion that needs the whole file
-	 * (text=auto / core.autocrlf, clean/smudge filters, working-tree-
-	 * encoding): git has no streaming filter for those, so, like bench
-	 * add, apply them in memory for a file up to core.bigFileThreshold
-	 * (the S_IFREG code below) and write a larger file unconverted,
-	 * which matches what add stored for it.
+	 * memory. Conversions follow bench add's rule, so a round trip
+	 * gives back the same bytes: a file up to core.bigFileThreshold is
+	 * converted (streamed for text, eol and ident; in memory, below,
+	 * for text=auto / core.autocrlf, clean/smudge filters and
+	 * working-tree-encoding, which need the whole file). A larger file
+	 * was stored unconverted, so it is written unconverted.
 	 */
 	if (ce_mode_s_ifmt == S_IFMANIFEST) {
 		struct stream_filter *filter = get_stream_filter_ca(ca, &ce->oid);
+		int converts = !filter || !is_null_stream_filter(filter);
 		int stream = 1;
 
-		if (!filter) {
+		if (converts) {
 			uint64_t file_size;
 			unsigned long limit = repo_settings_get_big_file_threshold(the_repository);
 
-			if (get_manifest_size(the_repository, &ce->oid, &file_size) < 0)
+			if (get_manifest_size(the_repository, &ce->oid, &file_size) < 0) {
+				if (filter)
+					free_stream_filter(filter);
 				return error("unable to read manifest of %s (%s)",
 					     ce->name, oid_to_hex(&ce->oid));
-			if (file_size <= limit) {
-				stream = 0;
-			} else {
+			}
+			if (file_size > limit) {
 				struct strbuf lim = STRBUF_INIT;
 
 				strbuf_humanise_bytes(&lim, limit);
@@ -401,6 +403,11 @@ static int write_entry(struct cache_entry *ce, char *path, struct conv_attrs *ca
 					  "filters are not applied (it was stored unfiltered)"),
 					ce->name, lim.buf);
 				strbuf_release(&lim);
+				if (filter)
+					free_stream_filter(filter);
+				filter = NULL;
+			} else if (!filter) {
+				stream = 0;
 			}
 		}
 		if (stream) {

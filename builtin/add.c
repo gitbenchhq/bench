@@ -57,7 +57,7 @@ static int chmod_pathspec(struct repository *repo,
 		if (!show_only)
 			err = chmod_index_entry(repo->index, ce, flip);
 		else
-			err = S_ISREG(ce->ce_mode) ? 0 : -1;
+			err = S_ISREG(ce->ce_mode) || S_ISMANIFEST(ce->ce_mode) ? 0 : -1;
 
 		if (err < 0)
 			ret = error(_("cannot chmod %cx '%s'"), flip, ce->name);

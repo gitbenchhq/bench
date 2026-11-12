@@ -302,6 +302,9 @@ static int add_one_path(const struct cache_entry *old, const char *path, int len
 	ce->ce_namelen = len;
 	fill_stat_cache_info(the_repository->index, ce, st);
 	ce->ce_mode = ce_mode_from_stat(old, st->st_mode);
+	/* As add: bench stores every regular file as a manifest. */
+	if (S_ISREG(ce->ce_mode) && repo_has_bench_extensions(the_repository))
+		ce->ce_mode = S_IFMANIFEST | (ce->ce_mode & 0777);
 
 	if (index_path(the_repository->index, &ce->oid, path, st,
 		       info_only ? 0 : INDEX_WRITE_OBJECT)) {

@@ -24,6 +24,16 @@ enum {
 int index_fd(struct index_state *istate, struct object_id *oid, int fd, struct stat *st, enum object_type type, const char *path, unsigned flags);
 int index_path(struct index_state *istate, struct object_id *oid, const char *path, struct stat *st, unsigned flags);
 
+/*
+ * Compare a working tree file with the manifest stored for it: 0 if the
+ * file holds the content `bench add` would store (its filters applied the
+ * same way), 1 if it does not, -1 on error. Only the manifest's header is
+ * used, so no chunk is read; a file that is not filtered is streamed.
+ */
+int working_file_differs_from_manifest(struct index_state *istate,
+				       const char *path, struct stat *st,
+				       const struct object_id *manifest_oid);
+
 struct odb_source;
 
 /*
