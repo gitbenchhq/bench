@@ -182,6 +182,21 @@ ifndef::git-pull[]
 	object database pack consolidation to remove any duplicate objects.
 endif::git-pull[]
 
+--full::
+--no-full::
+	After fetching, download every object reachable from any ref
+	(all branches, tags and remote-tracking branches, in all history)
+	that a partial clone left out, from the promisor remotes, so the
+	repository holds a complete copy. Nothing is downloaded when
+	nothing is missing. The promisor remotes stay configured, and a
+	later fetch without `--full` is partial again. If some objects
+	cannot be downloaded, the command fails with their number and keeps
+	what arrived; running it again continues. `--no-full` overrides
+	`fetch.full`.
+ifdef::git-pull[]
+	The download runs before the merge.
+endif::git-pull[]
+
 --refmap=<refspec>::
 	When fetching refs listed on the command line, use the
 	specified refspec (can be given more than once) to map the

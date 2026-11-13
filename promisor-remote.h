@@ -35,6 +35,15 @@ void promisor_remote_get_direct(struct repository *repo,
 				int oid_nr);
 
 /*
+ * Like promisor_remote_get_direct(), but never dies when an object cannot
+ * be fetched. Returns 0 when a promisor remote fetched them all, -1
+ * otherwise; the caller checks which objects arrived.
+ */
+int promisor_remote_get_direct_gently(struct repository *repo,
+				      const struct object_id *oids,
+				      int oid_nr);
+
+/*
  * Prepare a "promisor-remote" advertisement by a server.
  * Check the value of "promisor.advertise" and maybe the configured
  * promisor remotes, if any, to prepare information to send in an

@@ -193,6 +193,15 @@ objects from the source repository into a pack in the cloned repository.
 	at least _<size>_. For more details on filter specifications, see
 	the `--filter` option in linkgit:git-rev-list[1].
 
+`--full`::
+`--no-full`::
+	After the checkout, download every object reachable from any ref
+	(all branches and tags, in all history) that a partial clone left
+	out, as `git fetch --full` does, so the clone holds a complete copy.
+	The promisor remote stays configured. If this step fails, the clone
+	is kept; running `git fetch --full` in it continues. `--no-full`
+	overrides `fetch.full`.
+
 `--also-filter-submodules`::
 	Also apply the partial clone filter to any submodules in the repository.
 	Requires `--filter` and `--recurse-submodules`. This can be turned on by

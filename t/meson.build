@@ -1102,6 +1102,7 @@ integration_tests = [
   't9953-bench-defaults.sh',
   't9954-bench-diff-stat-dirty.sh',
   't9955-bench-fsck-special-files.sh',
+  't9956-bench-fetch-full.sh',
 ]
 
 benchmarks = [

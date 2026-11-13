@@ -42,10 +42,11 @@ static int fetch_objects(struct repository *repo,
 	child.in = -1;
 	if (repo != the_repository)
 		prepare_other_repo_env(&child.env, repo->gitdir);
+	/* --no-full: this fetch is one download of fetch.full; it must not start another. */
 	strvec_pushl(&child.args, "-c", "fetch.negotiationAlgorithm=noop",
 		     "fetch", remote_name, "--no-tags",
 		     "--no-write-fetch-head", "--recurse-submodules=no",
-		     "--filter=blob:none", "--stdin", NULL);
+		     "--filter=blob:none", "--no-full", "--stdin", NULL);
 	if (!git_config_get_bool("promisor.quiet", &quiet) && quiet)
 		strvec_push(&child.args, "--quiet");
 	if (start_command(&child))
@@ -267,18 +268,19 @@ static int remove_fetched_oids(struct repository *repo,
 	return remaining_nr;
 }
 
-void promisor_remote_get_direct(struct repository *repo,
-				const struct object_id *oids,
-				int oid_nr)
+static int get_direct(struct repository *repo,
+		      const struct object_id *oids,
+		      int oid_nr, int die_if_missing)
 {
 	struct promisor_remote *r;
 	struct object_id *remaining_oids = (struct object_id *)oids;
 	int remaining_nr = oid_nr;
 	int to_free = 0;
+	int ret = -1;
 	int i;
 
 	if (oid_nr == 0)
-		return;
+		return 0;
 
 	promisor_remote_init(repo);
 
@@ -296,15 +298,33 @@ void promisor_remote_get_direct(struct repository *repo,
 		goto all_fetched;
 	}
 
-	for (i = 0; i < remaining_nr; i++) {
+	for (i = 0; die_if_missing && i < remaining_nr; i++) {
 		if (is_promisor_object(repo, &remaining_oids[i]))
 			die(_("could not fetch %s from promisor remote"),
 			    oid_to_hex(&remaining_oids[i]));
 	}
+	goto done;
 
 all_fetched:
+	ret = 0;
+done:
 	if (to_free)
 		free(remaining_oids);
+	return ret;
+}
+
+void promisor_remote_get_direct(struct repository *repo,
+				const struct object_id *oids,
+				int oid_nr)
+{
+	get_direct(repo, oids, oid_nr, 1);
+}
+
+int promisor_remote_get_direct_gently(struct repository *repo,
+				      const struct object_id *oids,
+				      int oid_nr)
+{
+	return get_direct(repo, oids, oid_nr, 0);
 }
 
 static int allow_unsanitized(char ch)

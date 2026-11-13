@@ -19,6 +19,7 @@ Traditional version control systems struggle with large files because they store
 - **Large file handling**: Automatic chunking for files > 2MB
 - **Performance**: Constant memory usage regardless of file size
 - **Storage efficiency**: Only stores changed chunks, not entire files
+- **Complete copies of partial clones**: `bench clone --full`, `bench fetch --full` and `bench pull --full` download every file a partial clone left out (see [Partial Clones and Complete Copies](#partial-clones-and-complete-copies))
 
 ## Quick Start
 
@@ -249,6 +250,58 @@ bench push origin master
 bench pull origin master  # Get latest changes from server
 bench push origin master  # Send your changes to server
 ```
+
+### Partial Clones and Complete Copies
+
+A repository with many large files can be cloned without downloading
+every version of every file. A partial clone downloads the history (commits
+and directory listings) but file contents only when they are needed: the
+checkout downloads the files of the branch you are on, and switching to an
+old version downloads that version's files then. Your copy stays small, and
+everything still works.
+
+```bash
+# Partial clone (the server must allow it: uploadpack.allowFilter=true)
+bench clone --filter=blob:none ssh://server/~/repos/project.bench
+```
+
+Sometimes you want everything on your own disk: a backup, an archive, work
+on a laptop that will be offline, or a copy before the original is deleted.
+`--full` downloads every file of every branch and tag, in all history, that
+a partial clone left out:
+
+| Command | What it does |
+|---------|--------------|
+| `bench clone --full <url>` | Clone, then download everything |
+| `bench fetch --full` | Fetch, then download everything still missing |
+| `bench pull --full` | Same as `fetch --full`, then merge |
+| `bench clone -c fetch.full=true <url>` | A mirror: this clone and every later fetch and pull are complete |
+
+```bash
+# Turn an existing partial clone into a complete copy
+cd project
+bench fetch --full
+# Every object reachable from the refs is now local.
+
+# Run it again: nothing left to download
+bench fetch --full
+# Every object reachable from the refs is already local.
+```
+
+Good to know:
+
+- **It is a snapshot, not a mode.** After `bench fetch --full`, a plain
+  `bench fetch` or `bench pull` is partial again: new versions are
+  downloaded when needed. To keep a copy complete, set
+  `bench config fetch.full true` (or clone with `-c fetch.full=true`).
+- **Interrupted? Run it again.** What arrived is kept, so the next run
+  continues where the last one stopped. If some files cannot be downloaded,
+  the command says how many and exits with an error.
+- **A failed `clone --full` keeps the clone.** The checked-out files are
+  usable; run `bench fetch --full` inside it to finish.
+- **The clone stays a partial clone.** Its remote is still where missing
+  files come from, so later fetches without `--full` work as before.
+- `--no-full` turns it off for one command when `fetch.full` is set.
 
 ### Performance Tips for Large Files
 

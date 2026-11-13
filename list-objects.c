@@ -136,11 +136,14 @@ static void process_manifest(struct traversal_context *ctx,
 	    is_promisor_object(ctx->revs->repo, &obj->oid))
 		return;
 
-	/* Get manifest total size for potential filtering */
-	if (get_manifest_chunk_oids(ctx->revs->repo, &obj->oid, &total_size, &chunk_oids) < 0) {
+	/*
+	 * A manifest that cannot be read (missing from a partial clone that
+	 * does not fetch lazily, or damaged) is still shown, without its
+	 * chunks, so the caller can report it or fetch it, as for a missing
+	 * blob. Skipping it would hide that it and its chunks are missing.
+	 */
+	if (get_manifest_chunk_oids(ctx->revs->repo, &obj->oid, &total_size, &chunk_oids) < 0)
 		oid_array_clear(&chunk_oids);
-		return;
-	}
 
 	pathlen = path->len;
 	strbuf_addstr(path, name);

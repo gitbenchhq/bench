@@ -36,6 +36,7 @@
 #include "commit-reach.h"
 #include "branch.h"
 #include "promisor-remote.h"
+#include "fetch-full.h"
 #include "commit-graph.h"
 #include "shallow.h"
 #include "trace.h"
@@ -85,6 +86,7 @@ static int prune_tags = -1; /* unspecified */
 static int append, dry_run, force, keep, update_head_ok;
 static int write_fetch_head = 1;
 static int verbosity, deepen_relative, set_upstream, refetch;
+static int full = -1;
 static int progress = -1;
 static int tags = TAGS_DEFAULT, update_shallow, deepen;
 static int atomic_fetch;
@@ -110,6 +112,7 @@ struct fetch_config {
 	int recurse_submodules;
 	int parallel;
 	int submodule_fetch_jobs;
+	int full;
 };
 
 static int git_fetch_config(const char *k, const char *v,
@@ -129,6 +132,11 @@ static int git_fetch_config(const char *k, const char *v,
 
 	if (!strcmp(k, "fetch.prunetags")) {
 		fetch_config->prune_tags = git_config_bool(k, v);
+		return 0;
+	}
+
+	if (!strcmp(k, "fetch.full")) {
+		fetch_config->full = git_config_bool(k, v);
 		return 0;
 	}
 
@@ -2123,6 +2131,8 @@ static int fetch_multiple(struct string_list *list, int max_children,
 	strvec_pushl(&argv, "-c", "fetch.bundleURI=",
 		     "fetch", "--append", "--no-auto-gc",
 		     "--no-write-commit-graph", NULL);
+	/* The full pass runs once, here, after every remote is fetched. */
+	strvec_push(&argv, "--no-full");
 	for (i = 0; i < server_options.nr; i++)
 		strvec_pushf(&argv, "--server-option=%s", server_options.items[i].string);
 	add_options_to_argv(&argv, config);
@@ -2368,6 +2378,8 @@ int cmd_fetch(int argc,
 		OPT_SET_INT_F(0, "refetch", &refetch,
 			      N_("re-fetch without negotiating common commits"),
 			      1, PARSE_OPT_NONEG),
+		OPT_BOOL(0, "full", &full,
+			 N_("also download every object reachable from any ref that a partial clone left out")),
 		{
 			.type = OPTION_STRING,
 			.long_name = "submodule-prefix",
@@ -2428,6 +2440,15 @@ int cmd_fetch(int argc,
 
 	if (recurse_submodules_cli != RECURSE_SUBMODULES_DEFAULT)
 		config.recurse_submodules = recurse_submodules_cli;
+
+	if (full > 0) {
+		die_for_incompatible_opt2(full, "--full", dry_run, "--dry-run");
+		die_for_incompatible_opt2(full, "--full",
+					  negotiate_only, "--negotiate-only");
+	}
+	/* fetch.full is off for a dry run or a negotiation, which download nothing. */
+	if (full < 0)
+		full = config.full && !dry_run && !negotiate_only;
 
 	if (negotiate_only) {
 		switch (recurse_submodules_cli) {
@@ -2659,6 +2680,13 @@ int cmd_fetch(int argc,
 	 */
 	if (negotiate_only)
 		goto cleanup;
+
+	if (!result && full) {
+		trace2_region_enter("fetch", "full", the_repository);
+		if (fetch_full(the_repository, verbosity < 0))
+			result = 1;
+		trace2_region_leave("fetch", "full", the_repository);
+	}
 
 	prepare_repo_settings(the_repository);
 	if (fetch_write_commit_graph > 0 ||

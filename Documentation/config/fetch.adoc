@@ -56,6 +56,14 @@ fetch.all::
 	explicitly specifying one or more remote(s) to fetch from.
 	Defaults to false.
 
+fetch.full::
+	If true, `git fetch`, `git pull` and `git clone` behave as if
+	`--full` was given: after fetching, every object reachable from
+	any ref that a partial clone left out is downloaded, so the
+	repository stays a complete copy. Useful for a backup copy:
+	`git clone -c fetch.full=true <url>` sets it in the new
+	repository. Overridden by `--no-full`. Defaults to false.
+
 fetch.output::
 	Control how ref update status is printed. Valid values are
 	`full` and `compact`. Default value is `full`. See the

@@ -47,6 +47,7 @@
 #include "hook.h"
 #include "bundle.h"
 #include "bundle-uri.h"
+#include "fetch-full.h"
 
 /*
  * Overall FIXMEs:
@@ -66,6 +67,7 @@ struct clone_opts {
 }
 
 static int option_no_checkout, option_bare, option_mirror, option_single_branch = -1;
+static int option_full = -1;
 static int option_local = -1, option_no_hardlinks, option_shared;
 static int option_tags = 1; /* default enabled */
 static int option_shallow_submodules;
@@ -987,6 +989,8 @@ int cmd_clone(int argc,
 			 N_("apply partial clone filters to submodules")),
 		OPT_BOOL(0, "remote-submodules", &option_remote_submodules,
 			 N_("any cloned submodules will use their remote-tracking branch")),
+		OPT_BOOL(0, "full", &option_full,
+			 N_("after cloning, download every object reachable from any ref that a partial clone left out")),
 		OPT_BOOL(0, "sparse", &option_sparse_checkout,
 			 N_("initialize sparse-checkout file to include only files at root")),
 		OPT_STRING(0, "bundle-uri", &bundle_uri,
@@ -1627,6 +1631,23 @@ int cmd_clone(int argc,
 	junk_mode = JUNK_LEAVE_REPO;
 	err = checkout(submodule_progress, filter_submodules,
 		       ref_storage_format);
+
+	/*
+	 * Download the rest after the checkout, as "fetch --full" would in
+	 * the new repository. If it fails, keep the clone: it is usable, and
+	 * running "fetch --full" in it continues where this stopped.
+	 */
+	if (option_full < 0 &&
+	    repo_config_get_bool(the_repository, "fetch.full", &option_full))
+		option_full = 0;
+	if (!err && option_full) {
+		junk_mode = JUNK_LEAVE_ALL;
+		if (fetch_full(the_repository, option_verbosity < 0)) {
+			advise(_("The clone is usable without the missing objects. To download\n"
+				 "them later, run \"bench fetch --full\" in it."));
+			err = 1;
+		}
+	}
 
 	string_list_clear(&option_not, 0);
 	string_list_clear(&option_config, 0);
