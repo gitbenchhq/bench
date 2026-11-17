@@ -7,10 +7,18 @@ format_one () {
 	command="$2"
 	attributes="$3"
 
-	path="$source_dir/Documentation/$command.adoc"
+	# Commands are named bench-* but most manual pages are still git-*.adoc;
+	# fall back to the git-* page, as generate-cmdlist.sh does.
+	docname="$command"
+	path="$source_dir/Documentation/$docname.adoc"
 	if ! test -f "$path"
 	then
-		echo >&2 "No such file $path"
+		docname="git${command#bench}"
+		path="$source_dir/Documentation/$docname.adoc"
+	fi
+	if ! test -f "$path"
+	then
+		echo >&2 "No such file $source_dir/Documentation/$command.adoc"
 		exit 1
 	fi
 
@@ -54,10 +62,10 @@ format_one () {
 	fi
 
 	case "$description" in
-	"$command - "*)
-		text="${description#$command - }"
+	"$docname - "*)
+		text="${description#$docname - }"
 
-		printf "linkgit:%s[%s]::\n\t" "$command" "$mansection"
+		printf "linkgit:%s[%s]::\n\t" "$docname" "$mansection"
 		case "$attributes" in
 		*" deprecated "*)
 			printf "(deprecated) "
@@ -66,7 +74,7 @@ format_one () {
 		printf "$text.\n\n"
 		;;
 	*)
-		echo >&2 "Description does not match $command: $description"
+		echo >&2 "Description does not match $docname: $description"
 		exit 1
 		;;
 	esac

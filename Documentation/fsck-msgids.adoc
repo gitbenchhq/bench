@@ -53,6 +53,33 @@
 `badType`::
 	(ERROR) Found an invalid object type.
 
+`benchmodulesBlob`::
+	(ERROR) A non-blob found at `.benchmodules`.
+
+`benchmodulesLarge`::
+	(ERROR) The `.benchmodules` file is too large to parse.
+
+`benchmodulesMissing`::
+	(ERROR) Unable to read `.benchmodules` blob.
+
+`benchmodulesName`::
+	(ERROR) A submodule name is invalid.
+
+`benchmodulesParse`::
+	(INFO) Could not parse `.benchmodules` blob.
+
+`benchmodulesPath`::
+	(ERROR) `.benchmodules` path is invalid.
+
+`benchmodulesSymlink`::
+	(ERROR) `.benchmodules` is a symlink.
+
+`benchmodulesUpdate`::
+	(ERROR) Found an invalid submodule update setting.
+
+`benchmodulesUrl`::
+	(ERROR) Found an invalid submodule url.
+
 `duplicateEntries`::
 	(ERROR) A tree contains duplicate file entries.
 
@@ -89,36 +116,6 @@
 `gitignoreSymlink`::
 	(INFO) `.gitignore` is a symlink.
 
-`gitmodulesBlob`::
-	(ERROR) A non-blob found at `.gitmodules`.
-
-`gitmodulesLarge`::
-	(ERROR) The `.gitmodules` file is too large to parse.
-
-`gitmodulesMissing`::
-	(ERROR) Unable to read `.gitmodules` blob.
-
-`gitmodulesName`::
-	(ERROR) A submodule name is invalid.
-
-`gitmodulesParse`::
-	(INFO) Could not parse `.gitmodules` blob.
-
-`gitmodulesLarge`;
-	(ERROR) `.gitmodules` blob is too large to parse.
-
-`gitmodulesPath`::
-	(ERROR) `.gitmodules` path is invalid.
-
-`gitmodulesSymlink`::
-	(ERROR) `.gitmodules` is a symlink.
-
-`gitmodulesUpdate`::
-	(ERROR) Found an invalid submodule update setting.
-
-`gitmodulesUrl`::
-	(ERROR) Found an invalid submodule url.
-
 `hasDot`::
 	(WARN) A tree contains an entry named `.`.
 
@@ -137,6 +134,42 @@
 
 `mailmapSymlink`::
 	(INFO) `.mailmap` is a symlink.
+
+`manifestBadChunkCount`::
+	(ERROR) The `chunk_count` line of a manifest is missing, not canonical, or zero.
+
+`manifestBadChunkLine`::
+	(ERROR) A chunk line of a manifest is not `<oid> <size>`.
+
+`manifestBadContentOid`::
+	(ERROR) The `content_oid` line of a manifest is missing or not a full object id in lowercase hex.
+
+`manifestBadTotalSize`::
+	(ERROR) The `total_size` line of a manifest is missing or not canonical.
+
+`manifestBadVersion`::
+	(ERROR) The version line of a manifest is missing or not canonical.
+
+`manifestChunkCorrupt`::
+	(ERROR) A chunk named by a manifest cannot be read, or its content does not hash to its object id. Checked with `--strict` only, because it reads every chunk.
+
+`manifestChunkCountMismatch`::
+	(ERROR) A manifest has more or fewer chunk lines than its `chunk_count`, or trailing bytes after them.
+
+`manifestChunkSizeMismatch`::
+	(ERROR) A chunk named by a manifest has a different size than its chunk line says.
+
+`manifestChunkWrongType`::
+	(ERROR) An object named as a chunk by a manifest is not a blob.
+
+`manifestContentMismatch`::
+	(ERROR) The `content_oid` of a manifest is not the blob id of the file its chunks reassemble. Checked with `--strict` only.
+
+`manifestSizeMismatch`::
+	(ERROR) The chunk sizes of a manifest do not add up to its `total_size`.
+
+`manifestUnknownVersion`::
+	(ERROR) A manifest has a canonical version line for a version this bench does not support.
 
 `missingAuthor`::
 	(ERROR) Author is missing.

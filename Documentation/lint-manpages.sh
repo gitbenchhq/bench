@@ -17,7 +17,11 @@ check_missing_docs () (
 
 	for v in $ALL_COMMANDS
 	do
-		case "$v" in
+		# Commands are named bench-*; most manual pages are still git-*.adoc.
+		doc="$v"
+		test -f "$doc.adoc" || doc="git${v#bench}"
+
+		case "$doc" in
 		git-merge-octopus) continue;;
 		git-merge-ours) continue;;
 		git-merge-recursive) continue;;
@@ -31,14 +35,14 @@ check_missing_docs () (
 		git-?*--?* ) continue ;;
 		esac
 
-		if ! test -f "$v.adoc"
+		if ! test -f "$doc.adoc"
 		then
 			echo "no doc: $v"
 			ret=1
 		fi
 
 		if ! sed -e '1,/^### command list/d' -e '/^#/d' ../command-list.txt |
-			grep -q "^$v[ 	]"
+			grep -q "^\(${v}\|bench${v#git}\)[ 	]"
 		then
 			case "$v" in
 			git)
@@ -65,9 +69,13 @@ check_extraneous_docs () {
 		make print-man1 |
 		grep '\.adoc$' |
 		sed -e 's|^|documented |' \
-		    -e 's/\.adoc//'
+		    -e 's/\.adoc//' \
+		    -e 's/^documented git-/documented bench-/'
 	) | (
 		all_commands="$(printf "%s " "$ALL_COMMANDS" "$BUILT_INS" "$EXCLUDED_PROGRAMS" | tr '\n' ' ')"
+		# git-gui and git-citool keep their git- names in the build but are
+		# listed and documented under bench- names.
+		all_commands="$all_commands $(printf "%s\n" $all_commands | sed -n 's/^git-/bench-/p' | tr '\n' ' ')"
 		ret=0
 
 		while read how cmd
