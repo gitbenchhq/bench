@@ -129,6 +129,52 @@ test_expect_success 'interleaving hook calls succeed' '
 	test_cmp expect target-repo.git/actual
 '
 
+test_expect_success 'hook does not get updates rejected in a non-atomic push' '
+	test_when_finished "rm -r target-repo.git actual" &&
+
+	git init --bare target-repo.git &&
+	OTHER_OID=$(git commit-tree -p POST -m other POST^{tree}) &&
+	git push ./target-repo.git PRE:refs/heads/good PRE:refs/heads/stale \
+		PRE:refs/heads/df $OTHER_OID:refs/heads/other &&
+
+	# Move "stale" while the push is in progress, so that its update
+	# has the wrong old value when the transaction is prepared.
+	test_hook -C target-repo.git update <<-\EOF &&
+		if test "$1" = refs/heads/stale
+		then
+			git -c core.hooksPath=no-hooks update-ref "$1" refs/heads/other
+		fi
+	EOF
+
+	test_hook -C target-repo.git reference-transaction <<-\EOF &&
+		echo "$1" >>actual
+		cat >>actual
+	EOF
+
+	# "stale" is rejected for its old value and "df/sub" for a
+	# name conflict with "df"; only "good" is applied.
+	test_must_fail git push ./target-repo.git POST:refs/heads/good \
+		POST:refs/heads/stale POST:refs/heads/df/sub &&
+
+	cat >expect <<-EOF &&
+		prepared
+		$PRE_OID $POST_OID refs/heads/good
+		committed
+		$PRE_OID $POST_OID refs/heads/good
+	EOF
+	test_cmp expect target-repo.git/actual &&
+
+	git -C target-repo.git rev-parse refs/heads/good refs/heads/stale \
+		refs/heads/df >actual &&
+	cat >expect <<-EOF &&
+		$POST_OID
+		$OTHER_OID
+		$PRE_OID
+	EOF
+	test_cmp expect actual &&
+	test_must_fail git -C target-repo.git rev-parse --verify -q refs/heads/df/sub
+'
+
 test_expect_success 'hook captures git-symbolic-ref updates' '
 	test_when_finished "rm actual" &&
 

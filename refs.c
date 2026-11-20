@@ -2411,6 +2411,13 @@ static int run_transaction_hook(struct ref_transaction *transaction,
 		if (update->flags & REF_LOG_ONLY)
 			continue;
 
+		/*
+		 * A transaction that allows failures does not apply the
+		 * updates it rejected, so the hook does not see them.
+		 */
+		if (update->rejection_err)
+			continue;
+
 		strbuf_reset(&buf);
 
 		if (!(update->flags & REF_HAVE_OLD))
